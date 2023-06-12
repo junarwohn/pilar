@@ -5,8 +5,16 @@ import re
 import numpy as np
 import difflib
 from difflib import SequenceMatcher
+import matplotlib.pyplot as plt
+from sklearn import svm
+import pickle
+from tqdm import tqdm
 
+IS_DEDUG=False
+#IS_DEDUG=True
 
+filename = 'svm_models.sav'
+svm_clfs = pickle.load(open(filename, 'rb'))
 def img_similarity(img1, img2):
     
     #gray1 = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
@@ -17,7 +25,7 @@ def img_similarity(img1, img2):
     data2 = img2.flatten()
     return sum(np.isclose(data1, data2, atol=50)) / len(data1)
     #cnt = 0
-    #for p1, p2 in zip(data1, data2):
+    #for p1, p2 in zip(data1, data2)#:
     #    if p1 == p2:
     #        cnt += 1
     #return cnt / len(data1)
@@ -39,12 +47,13 @@ add_cnt = 0
 page_cnt = 0
 thumb_cnt = 0
 str_diff = 0
-img_diff = 0
+img_sim = 0
 ok = 13
-print(sample_img.shape)
+#print(sample_img.shape)
 # selection
-print("load preset? [{}:{}] [y/n]".format(str(height_upper), str(height_lower)))
-yn = input()
+#print("load preset? [{}:{}] [y/n]".format(str(height_upper), str(height_lower)))
+#yn = input()
+yn = 'y'
 if yn == 'y':
     bound_upper_complete = True
     bound_lower_complete = True
@@ -88,6 +97,8 @@ gray = cv2.cvtColor(cur_img, cv2.COLOR_BGR2GRAY)
 inverted = cv2.bitwise_not(gray)
 bilateral_filter = cv2.bilateralFilter(inverted, 9, 16, 16)
 r, pre_bin = cv2.threshold(bilateral_filter, 200, 255, cv2.THRESH_BINARY)
+if not IS_DEDUG:
+    file_list = tqdm(file_list)
 for file_name in file_list:
     # original_img = cv2.imread("src/extract/" + file_name)
     original_img = cv2.imread("src/extract/" + file_name)
@@ -111,59 +122,69 @@ for file_name in file_list:
     # new_img = dst
     text = image_to_string(dst, lang="Hangul", config="--psm 4 --oem 1")
     #text = image_to_string(dst, lang="kor", config="--psm 4 --oem 1")
-    word_list = re.sub("\d+|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅕㅓㅕㅗㅛㅜㅠㅡㅣ\{\}\[\]\/?.,;:|\)「＊ㆍ：”…*~`!^\-_+<>@\#$%&\\\=\(\'\"\f]|[A-Za-z]", "", text).split('\n')
+    word_list = re.sub("\d+|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅕㅓㅕㅗㅛㅜㅠㅡㅣ\{\}\[\]\/?.,;:|\)「＊ㆍ：”…*~`!^\-_+<>@\#$%&》\\\=\(\'\"\f]|[A-Za-z]", "", text).split('\n')
     cur_word = max(word_list, key=len)
     # Filter trash recognition
     if len(cur_word) < 2:
         continue
     if cur_word != pre_word:
-        str_diff= SequenceMatcher(None, cur_word, pre_word).ratio()
-        img_diff = img_similarity(pre_bin, cur_bin)
+        str_diff = SequenceMatcher(None, cur_word, pre_word).ratio()
+        img_sim = img_similarity(pre_bin, cur_bin)
 
 
-        if img_diff > 0.9:
-            #print("str pass : {:.03f}, img diff : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_diff, pre_word, cur_word))
-            continue
-        elif img_diff > 0.5:
-            if str_diff > 0.9:
-                #print("str diff: {:.03f}, img pass : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_diff, pre_word, cur_word))
+        if IS_DEDUG:
+            #print("Check something [{}], [{}]".format(pre_word, cur_word) )
+            cv2.imshow("dst", dst)
+            cv2.imshow("cur_bin", cur_bin)
+            add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+            cv2.imshow("Okay to enter", add_img)
+            ok = cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            if ok != 13:
+                print("SAME, str_diff : {:.03f}, img_sim : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_sim, pre_word, cur_word))
                 continue
-            if str_diff > 0.2:
-                print("Check something [{}], [{}]".format(pre_word, cur_word) )
+
+        else:
+            # diff sim order
+            vote = [clf.predict([[str_diff, img_sim]])[0] for clf in svm_clfs]
+            if sum(vote) == 0:
+                continue
+            else:
+                print(vote)
                 cv2.imshow("dst", dst)
                 cv2.imshow("cur_bin", cur_bin)
                 add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
                 cv2.imshow("Okay to enter", add_img)
                 ok = cv2.waitKey(0)
                 cv2.destroyAllWindows()
-            if ok != 13:
-                continue
+                if ok != 13:
+                    print("SAME, str_diff : {:.03f}, img_sim : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_sim, pre_word, cur_word))
+                    
+                    continue
 
-
-#        if str_diff > 0.9:
-#            #print("str pass : {:.03f}, img diff : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_diff, pre_word, cur_word))
-#            continue
-#        elif str_diff > 0.2:
-#            img_diff = img_similarity(pre_img, cur_img)
-#            # same word. obviously.
-#            if img_diff > 0.98:
-#                #print("str diff: {:.03f}, img pass : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_diff, pre_word, cur_word))
+#            if img_sim > 0.9:
+#                #print("str pass : {:.03f}, img diff : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_sim, pre_word, cur_word))
 #                continue
-#            if img_diff > 0.85:
-#                print("Check something [{}], [{}]".format(pre_word, cur_word) )
-#                cv2.imshow("dst", dst)
-#                cv2.imshow("cur_bin", cur_bin)
-#                add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
-#                cv2.imshow("Okay to enter", add_img)
-#                ok = cv2.waitKey(0)
-#                cv2.destroyAllWindows()
-#            if ok != 13:
-#                continue
+#            elif img_sim > 0.5:
+#                if str_diff > 0.9:
+#                    #print("str diff: {:.03f}, img pass : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_sim, pre_word, cur_word))
+#                    continue
+#                if str_diff > 0.2:
+#                    print("Check something [{}], [{}]".format(pre_word, cur_word) )
+#                    cv2.imshow("dst", dst)
+#                    cv2.imshow("cur_bin", cur_bin)
+#                    add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+#                    cv2.imshow("Okay to enter", add_img)
+#                    ok = cv2.waitKey(0)
+#                    cv2.destroyAllWindows()
+#                if ok != 13:
+#                    continue
 
-        print("str diff : {:.03f}, img diff : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_diff, pre_word, cur_word))
+
+        print("DIFF, str_diff : {:.03f}, img_sim : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_sim, pre_word, cur_word))
 #        if (0.9 > str_diff > 0.25):
 #        #if (True):
-#            print("str diff : {:.03f}, img diff : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_diff, pre_word, cur_word))
+#            print("str diff : {:.03f}, img diff : {:.03f}, pre : [{}], cur : [{}]".format(str_diff, img_sim, pre_word, cur_word))
 #        else:
 #            print("str diff : {:.03f}, img diff : -.---, pre : [{}], cur : [{}]".format(str_diff, pre_word, cur_word))
         cur_img2 = original_img[2 * height_upper - height_lower:height_upper, :]
@@ -174,7 +195,7 @@ for file_name in file_list:
         dst2 = bilateral_filter2
         text = image_to_string(dst2, lang="Hangul", config="--psm 4 --oem 1")
         #text = image_to_string(dst2, lang="kor", config="--psm 4 --oem 1")
-        word_list = re.sub("\d+|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅑㅓㅕㅗㅛㅜㅠㅡㅣ\{\}\[\]\/?.,;:|\)「＊ㆍ：”…*~`!^\-_+<>@\#$%&\\\=\(\'\"\f]|[A-Za-z]", "",
+        word_list = re.sub("\d+|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅑㅓㅕㅗㅛㅜㅠㅡㅣ\{\}\[\]\/?.,;:|\)「＊ㆍ：”…*~`!^\-_+<>@\#$%&》\\\=\(\'\"\f]|[A-Za-z]", "",
                            text).split('\n')
         cur_word2 = max(word_list, key=len)
         """ MULTILINE CHECK """
