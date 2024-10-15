@@ -14,67 +14,94 @@ bool fileExists(const std::string& path) {
 }
 
 
-// 디렉토리에서 이미지를 로드하는 함수
-std::vector<cv::Mat> loadImagesFromFolder(const std::string& folderPath) {
-    std::vector<cv::Mat> images;
-    
-    DIR* dir = opendir(folderPath.c_str());
-    if (!dir) {
-        std::cerr << "Error: Could not open directory " << folderPath << std::endl;
-        return images;
-    }
-    std::vector<std::string> fileNames;
+/*
+std::vector<std::string> loadImageFiles(const std::string& folder_path) {
+	DIR* dir = opendir(folder_path.c_str());
+	if (!dir) {
+		std::cerr << "Error: Can not open directory " << folder_path << std::endl;
+		return NULL;
+	}
+
+    std::vector<std::string> file_names;
     struct dirent* entry;
     while ((entry = readdir(dir)) != NULL) {
-        std::string fileName = entry->d_name;
-        if (fileName.find(".jpg") != std::string::npos) {
-            fileNames.push_back(fileName);
+        std::string file_name = entry->d_name;
+        if (file_name.find(".jpg") != std::string::npos) {
+            file_names.push_back(file_name);
+        }
+    }
+
+	return file_names;
+}
+*/
+	
+
+// 디렉토리에서 이미지를 로드하는 함수
+std::vector<cv::Mat> loadImagesFromFolder(const std::string& folder_path) {
+    std::vector<cv::Mat> images;
+    
+    DIR* dir = opendir(folder_path.c_str());
+    if (!dir) {
+        std::cerr << "Error: Could not open directory " << folder_path << std::endl;
+        return images;
+    }
+    std::vector<std::string> file_names;
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != NULL) {
+        std::string file_name = entry->d_name;
+        if (file_name.find(".jpg") != std::string::npos) {
+            file_names.push_back(file_name);
         }
     }
     
     // Sort file names in ascending order
-    std::sort(fileNames.begin(), fileNames.end());
+    std::sort(file_names.begin(), file_names.end());
     
-    for (const auto& fileName : fileNames) {
-        std::string fullPath = folderPath + "/" + fileName;
-        cv::Mat img = cv::imread(fullPath, cv::IMREAD_COLOR);
+    for (const auto& file_name: file_names) {
+        std::string full_path = folder_path + "/" + file_name;
+        cv::Mat img = cv::imread(full_path, cv::IMREAD_COLOR);
         if (!img.empty()) {
             images.push_back(img);
-            // std::cout << "Loaded: " << fileName << std::endl;
+            std::cout << "Loaded: " << file_name << std::endl;
         } else {
-            std::cerr << "Failed to load: " << fileName << std::endl;
+            std::cerr << "Failed to load: " << file_name << std::endl;
         }
     }
     
     closedir(dir);
+    std::cout << "LOAD DONE" << std::endl;
     return images;
 }
 
 int main() {
-    std::string extractFolderPath = "../../src/extract";
+    std::string extract_folder_path= "../../src/extract";
+
+    std::cout << "Welcome" << std::endl;
     
-    if (!fileExists(extractFolderPath)) {
-        std::cerr << "Error: Folder does not exist: " << extractFolderPath << std::endl;
+    if (!fileExists(extract_folder_path)) {
+        std::cerr << "Error: Folder does not exist: " << extract_folder_path << std::endl;
         return 1;
     }
+
     
-    std::vector<cv::Mat> extractedImages = loadImagesFromFolder(extractFolderPath);
+    std::cout << "Load Images" << std::endl;
+    std::vector<cv::Mat> extracted_images = loadImagesFromFolder(extract_folder_path);
     
-    std::cout << "Total images loaded: " << extractedImages.size() << std::endl;
+    std::cout << "Total images loaded: " << extracted_images.size() << std::endl;
     
 
     cv::namedWindow("Image Viewer", cv::WINDOW_NORMAL);  // 창 생성
-    for (size_t i = 0; i < extractedImages.size(); ++i) {
-        if (extractedImages[i].empty()) {
+    for (size_t i = 0; i < extracted_images.size(); ++i) {
+        if (extracted_images[i].empty()) {
             std::cerr << "Image is empty!" << std::endl;
             continue;
         }
-        int originalWidth = extractedImages[i].cols;
-        int originalHeight = extractedImages[i].rows;
+        int original_width = extracted_images[i].cols;
+        int original_height = extracted_images[i].rows;
         
-        cv::Mat resizedImage;
-        cv::resize(extractedImages[i], resizedImage, cv::Size(originalWidth / 2, originalHeight / 2 ));
-        cv::imshow("Image Viewer", resizedImage);
+        cv::Mat resized_image;
+        cv::resize(extracted_images[i], resized_image, cv::Size(original_width / 2, original_height / 2 ));
+        cv::imshow("Image Viewer", resized_image);
             
         int key = cv::waitKey(0);
         
