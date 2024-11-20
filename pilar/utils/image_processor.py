@@ -9,16 +9,24 @@ from sklearn import svm
 import pickle
 from tqdm import tqdm
 import time
+import os
+import cv2
+import shutil
+from pathlib import Path
+import numpy as np
 
 class ImageProcessor:
     def __init__(self):
         self.day_info = time.strftime('%Y-%m-%d', time.localtime())[2:]
         self.IS_DEBUG = False
+        out_dir = f"./out/{self.day_info}"
+        os.makedirs(out_dir, exist_ok=True)
+        self.extract_dir = f"./out/{self.day_info}/extract"
+        self.thumbs_dir = f"./out/{self.day_info}/thumbs"
         self.load_models()
         self.init_parameters()
         self.load_file_lists()
-        out_dir = f"./out/{self.day_info}"
-        os.makedirs(out_dir, exist_ok=True)
+        
 
     def load_models(self):
         mod_path = 'svm_models.sav'
@@ -34,9 +42,9 @@ class ImageProcessor:
         self.pre_word = ""
 
     def load_file_lists(self):
-        self.file_list = [i for i in os.listdir("src/extract/") if not i.startswith('.') and not 'Zone.Identifier' in i]
+        self.file_list = [i for i in os.listdir(self.extract_dir) if not i.startswith('.') and not 'Zone.Identifier' in i]
         self.file_list.sort()
-        self.thumb_list = [i for i in os.listdir("src/thumbs/") if not i.startswith('.') and not 'Zone.Identifier' in i]
+        self.thumb_list = [i for i in os.listdir(self.thumbs_dir) if not i.startswith('.') and not 'Zone.Identifier' in i]
         self.thumb_list.sort()
 
     @staticmethod
@@ -46,7 +54,7 @@ class ImageProcessor:
         return sum(np.isclose(data1, data2, atol=50)) / len(data1)
 
     def get_bounds(self):
-        sample_img = cv2.imread("src/extract/" + self.file_list[50])
+        sample_img = cv2.imread(f"{self.extract_dir}/" + self.file_list[50])
         bound_upper_complete = bound_lower_complete = False
 
         yn = 'y'
@@ -89,13 +97,12 @@ class ImageProcessor:
 
     def extract_text(self, img):
         text = image_to_string(img, lang="Hangul", config="--psm 4 --oem 1")
-        word_list = re.sub("|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅕㅓㅕㅗㅛㅜㅠㅡㅣ\{\}\[\]\/?.,;:|\)「＊ㆍ：\"…*~`!^\-_+<>@\#$%&》\\\=\(\'\"\f]|[A-Za-z]™", "", text).split('\n')
+        word_list = re.sub("|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅕㅓㅕㅗㅛㅜㅠㅡㅣㅔㅐㅑㅒㅖㅘㅙㅚㅝㅞㅟㅢ\{\}\[\]\/?.,;:|\)「＊ㆍ：\"…*~`!^\-_+<>@\#$%&》\\\=\(\'\"\f]|[A-Za-z]", "", text).split('\n')
         return max(word_list, key=len)
 
     def process_files(self):
-        result_img = cv2.imread("src/thumbs/" + self.thumb_list[self.thumb_cnt])[:self.height_upper - 20, :]
-        
-        original_img = cv2.imread("src/extract/" + self.file_list[0])
+        result_img = self.get_new_result_img()
+        original_img = cv2.imread(f"{self.extract_dir}/" + self.file_list[0])
         pre_img = original_img[self.height_upper:self.height_lower, :]
         pre_processed, pre_bin = self.process_image(pre_img)
 
@@ -103,7 +110,7 @@ class ImageProcessor:
             self.file_list = tqdm(self.file_list)
 
         for file_name in self.file_list:
-            original_img = cv2.imread("src/extract/" + file_name)
+            original_img = cv2.imread(f"{self.extract_dir}/" + file_name)
             cur_img = original_img[self.height_upper:self.height_lower, :]
             processed_img, cur_bin = self.process_image(cur_img)
             
@@ -195,6 +202,53 @@ class ImageProcessor:
 
     def get_new_result_img(self):
         try:
-            return cv2.imread("src/thumbs/" + self.thumb_list[self.thumb_cnt])[:self.height_upper - 5, :]
+            return cv2.imread(f"{self.thumbs_dir}/" + self.thumb_list[self.thumb_cnt])[:self.height_upper - 5, :]
         except:
-            return cv2.imread("src/thumbs/" + self.thumb_list[-1])[:self.height_upper - 5, :]
+            return cv2.imread(f"{self.thumbs_dir}/" + self.thumb_list[-1])[:self.height_upper - 5, :]
+
+    def select_thumbs(self, step_size=150):
+        # Get sorted list of jpg files from extract directory
+        extract_dir = Path(self.extract_dir)
+        thumbs_dir = Path(self.thumbs_dir)
+        
+        # Create thumbs directory if it doesn't exist
+        thumbs_dir.mkdir(exist_ok=True)
+        
+        # Get and sort image files
+        image_files = sorted([f for f in extract_dir.glob('*.jpg')])
+        
+        if not image_files:
+            print("No jpg files found in ./src/extract")
+            return
+            
+        current_idx = step_size - 1  # Start from step_size'th image (index step_size-1)
+        while current_idx < len(image_files):
+            # Show image number out of total
+            print(f"Image {current_idx + 1} of {len(image_files)}")
+            
+            # Read and display image
+            img = cv2.imread(str(image_files[current_idx]))
+            cv2.imshow('Image', img)
+            
+            # Wait for keypress
+            key = cv2.waitKey(0) & 0xFF
+            
+            if key == 13:  # Enter key
+                # Copy file to thumbs directory
+                dest_path = thumbs_dir / image_files[current_idx].name
+                shutil.copy2(image_files[current_idx], dest_path)
+                print(f"Copied {image_files[current_idx].name} to thumbs directory")
+                current_idx += step_size  # Move to next image
+            elif key == 83:  # Right arrow or 'd' key
+                current_idx += 1  # Move to next image
+            elif key == 81:  # Left arrow key
+                current_idx = max(0, current_idx - 1)  # Move to previous image, but not below 0
+            elif key == 27:  # ESC key
+                break
+                
+            # Check if we've reached the end
+            if current_idx >= len(image_files):
+                print("Reached end of images")
+                break
+        cv2.destroyAllWindows()
+        self.load_file_lists()
