@@ -57,12 +57,8 @@ class ImageProcessor:
         sample_img = cv2.imread(f"{self.extract_dir}/" + self.file_list[50])
         bound_upper_complete = bound_lower_complete = False
 
-        yn = 'y'
-        if yn == 'y':
-            return True, True
-
         while not bound_upper_complete:
-            print("input_upper")
+            print("input_upper, currernt :", self.height_upper)
             self.height_upper = int(input())
             sliced = sample_img[self.height_upper:, :]
             print(sliced.shape)
@@ -76,9 +72,9 @@ class ImageProcessor:
             cv2.destroyAllWindows()
 
         while not bound_lower_complete:
-            print("input_lower")
+            print("input_lower, currernt :", self.height_lower)
             self.height_lower = int(input())
-            sliced = sample_img[self.height_upper:self.height_lower - 20, :]
+            sliced = sample_img[self.height_upper:self.height_lower, :]
             cv2.namedWindow("height_lower", cv2.WINDOW_NORMAL)
             cv2.imshow("height_lower", sliced)
             cv2.resizeWindow("height_lower", 600, 600)
