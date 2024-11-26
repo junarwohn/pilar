@@ -55,34 +55,52 @@ class ImageProcessor:
 
     def get_bounds(self):
         sample_img = cv2.imread(f"{self.extract_dir}/" + self.file_list[50])
-        bound_upper_complete = bound_lower_complete = False
+        
+        # Show current bounds
+        sliced = sample_img[self.height_upper:self.height_lower, :]
+        cv2.namedWindow("current_bounds", cv2.WINDOW_NORMAL)
+        cv2.imshow("current_bounds", sliced)
+        cv2.resizeWindow("current_bounds", 600, 600)
+        print("Are the current bounds acceptable? [enter/other]")
+        ret = cv2.waitKey(0)
+        cv2.destroyAllWindows()
 
-        while not bound_upper_complete:
-            print("input_upper, currernt :", self.height_upper)
-            self.height_upper = int(input())
-            sliced = sample_img[self.height_upper:, :]
-            print(sliced.shape)
-            cv2.namedWindow("height_upper", cv2.WINDOW_NORMAL)
-            cv2.imshow("height_upper", sliced)
-            cv2.resizeWindow("height_upper", 600, 600)
-            print("is it ok?[enter/other]")
-            ret = cv2.waitKey(0)
-            if ret == 13:
-                bound_upper_complete = True
-            cv2.destroyAllWindows()
+        if ret != 13:  # Not enter key
+            # Set upper boundary
+            bound_upper_complete = False
+            while not bound_upper_complete:
+                print(f"Current upper height: {self.height_upper}")
+                print("Enter new upper height:")
+                input_val = input()
+                if input_val:
+                    self.height_upper = int(input_val)
+                sliced = sample_img[self.height_upper:, :]
+                cv2.namedWindow("height_upper", cv2.WINDOW_NORMAL)
+                cv2.imshow("height_upper", sliced)
+                cv2.resizeWindow("height_upper", 600, 600)
+                print("Is this okay? [enter/other]")
+                ret = cv2.waitKey(0)
+                if ret == 13:
+                    bound_upper_complete = True
+                cv2.destroyAllWindows()
 
-        while not bound_lower_complete:
-            print("input_lower, currernt :", self.height_lower)
-            self.height_lower = int(input())
-            sliced = sample_img[self.height_upper:self.height_lower, :]
-            cv2.namedWindow("height_lower", cv2.WINDOW_NORMAL)
-            cv2.imshow("height_lower", sliced)
-            cv2.resizeWindow("height_lower", 600, 600)
-            print("is it ok?[enter/other]")
-            ret = cv2.waitKey(0)
-            if ret == 13:
-                bound_lower_complete = True
-            cv2.destroyAllWindows()
+            # Set lower boundary  
+            bound_lower_complete = False
+            while not bound_lower_complete:
+                print(f"Current lower height: {self.height_lower}")
+                print("Enter new lower height:")
+                input_val = input()
+                if input_val:
+                    self.height_lower = int(input_val)
+                sliced = sample_img[self.height_upper:self.height_lower, :]
+                cv2.namedWindow("height_lower", cv2.WINDOW_NORMAL)
+                cv2.imshow("height_lower", sliced)
+                cv2.resizeWindow("height_lower", 600, 600)
+                print("Is this okay? [enter/other]")
+                ret = cv2.waitKey(0)
+                if ret == 13:
+                    bound_lower_complete = True
+                cv2.destroyAllWindows()
 
     def process_image(self, img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -93,7 +111,7 @@ class ImageProcessor:
 
     def extract_text(self, img):
         text = image_to_string(img, lang="Hangul", config="--psm 4 --oem 1")
-        word_list = re.sub("|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅕㅓㅕㅗㅛㅜㅠㅡㅣㅔㅐㅑㅒㅖㅘㅙㅚㅝㅞㅟㅢ\{\}\[\]\/?.,;:|\)「＊ㆍ：\"…*~`!^\-_+<>@\#$%&》\\\=\(\'\"\f]|[A-Za-z]", "", text).split('\n')
+        word_list = re.sub(r"|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅕㅓㅕㅗㅛㅜㅠㅡㅣㅔㅐㅑㅒㅖㅘㅙㅚㅝㅞㅟㅢ{}\[\]/?.,;:|\)「＊ㆍ：\"…*~`!^\-_+<>@\#$%&》\\=\(\'\"\f]|[A-Za-z]", "", text).split('\n')
         return max(word_list, key=len)
 
     def process_files(self):
