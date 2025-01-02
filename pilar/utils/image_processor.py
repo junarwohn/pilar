@@ -14,11 +14,13 @@ import cv2
 import shutil
 from pathlib import Path
 import numpy as np
+from datetime import datetime
 
 class ImageProcessor:
-    def __init__(self):
+    def __init__(self, no_gui=False):
         self.day_info = time.strftime('%Y-%m-%d', time.localtime())[2:]
         self.IS_DEBUG = False
+        self.NO_GUI = no_gui
         out_dir = f"./out/{self.day_info}"
         os.makedirs(out_dir, exist_ok=True)
         self.extract_dir = f"./out/{self.day_info}/extract"
@@ -54,6 +56,9 @@ class ImageProcessor:
         return sum(np.isclose(data1, data2, atol=50)) / len(data1)
 
     def get_bounds(self):
+        if self.NO_GUI:
+            return
+            
         sample_img = cv2.imread(f"{self.extract_dir}/" + self.file_list[50])
         
         # Show current bounds
@@ -140,6 +145,12 @@ class ImageProcessor:
                     continue
 
                 print(f"\nDIFF, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                try:
+                    os.makedirs(f"out/{datetime.now().strftime('%y-%m-%d')}", exist_ok=True)
+                    with open(f"out/{datetime.now().strftime('%y-%m-%d')}/words.txt", "a", encoding="utf-8") as f:
+                        f.write(f"{cur_word}\n")
+                except OSError as e:
+                    print(f"Error writing to file: {e}")
                 
                 result_img = self.handle_multiline(original_img, cur_img, cur_word, result_img)
                 
@@ -156,7 +167,7 @@ class ImageProcessor:
             self.save_result(result_img)
 
     def handle_differences(self, processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word):
-        if self.IS_DEBUG:
+        if self.IS_DEBUG and not self.NO_GUI:
             return self.handle_debug_mode(processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word)
         else:
             return self.handle_production_mode(str_diff, img_sim, processed_img, cur_bin, pre_img, cur_img, cur_word)
@@ -179,6 +190,8 @@ class ImageProcessor:
             return True
         elif sum(vote) == 0:
             return False
+        elif self.NO_GUI:
+            return False
         else:
             cv2.imshow("dst", processed_img)
             cv2.imshow("cur_bin", cur_bin)
@@ -193,6 +206,9 @@ class ImageProcessor:
         return False
 
     def handle_multiline(self, original_img, cur_img, cur_word, result_img):
+        if self.NO_GUI:
+            return np.vstack((result_img, cur_img))
+            
         cur_img2 = original_img[2 * self.height_upper - self.height_lower:self.height_upper, :]
         processed_img2, _ = self.process_image(cur_img2)
         cur_word2 = self.extract_text(processed_img2)
@@ -221,6 +237,9 @@ class ImageProcessor:
             return cv2.imread(f"{self.thumbs_dir}/" + self.thumb_list[-1])[:self.height_upper - 5, :]
 
     def select_thumbs(self, step_size=150):
+        if self.NO_GUI:
+            return
+            
         # Get sorted list of jpg files from extract directory
         extract_dir = Path(self.extract_dir)
         thumbs_dir = Path(self.thumbs_dir)
