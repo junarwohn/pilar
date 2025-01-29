@@ -15,20 +15,36 @@ import shutil
 from pathlib import Path
 import numpy as np
 from datetime import datetime
+import subprocess
 
 class ImageProcessor:
-    def __init__(self, no_gui=False):
-        self.day_info = time.strftime('%Y-%m-%d', time.localtime())[2:]
+    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False):
+        self.video_path = video_path
+        self.extract_dir = extract_dir
+        self.thumbs_dir = thumbs_dir
         self.IS_DEBUG = False
         self.NO_GUI = no_gui
-        out_dir = f"./out/{self.day_info}"
-        os.makedirs(out_dir, exist_ok=True)
-        self.extract_dir = f"./out/{self.day_info}/extract"
-        self.thumbs_dir = f"./out/{self.day_info}/thumbs"
+        
+        # Clean and create directories
+        for directory in [self.extract_dir, self.thumbs_dir]:
+            if os.path.exists(directory):
+                shutil.rmtree(directory)
+            os.makedirs(directory)
+            
+        self.extract_frames()
         self.load_models()
         self.init_parameters()
         self.load_file_lists()
-        
+
+    def extract_frames(self, fps=2):
+        """Extract frames from video using ffmpeg"""
+        ffmpeg_cmd = [
+            'ffmpeg', 
+            '-i', self.video_path,
+            '-vf', f'fps={fps}',
+            f'{self.extract_dir}/img%04d.jpg'
+        ]
+        subprocess.run(ffmpeg_cmd)
 
     def load_models(self):
         mod_path = 'svm_models.sav'
@@ -115,7 +131,7 @@ class ImageProcessor:
         return bilateral_filter, binary
 
     def extract_text(self, img):
-        text = image_to_string(img, lang="Hangul", config="--psm 4 --oem 1")
+        text = image_to_string(img, lang="kor", config="--psm 4 --oem 1")
         word_list = re.sub(r"|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅕㅓㅕㅗㅛㅜㅠㅡㅣㅔㅐㅑㅒㅖㅘㅙㅚㅝㅞㅟㅢ{}\[\]/?.,;:|\)「＊ㆍ：\"…*~`!^\-_+<>@\#$%&》\\=\(\'\"\f]|[A-Za-z]", "", text).split('\n')
         return max(word_list, key=len)
 
@@ -224,7 +240,7 @@ class ImageProcessor:
         return np.vstack((result_img, cur_img))
 
     def save_result(self, result_img):
-        out_dir = f"./out/{self.day_info}"
+        out_dir = Path(self.video_path).parent
         img_path = f"{out_dir}/result-{str(self.page_cnt)}.jpg"
         cv2.imwrite(img_path, result_img)
         self.page_cnt += 1 
@@ -237,9 +253,6 @@ class ImageProcessor:
             return cv2.imread(f"{self.thumbs_dir}/" + self.thumb_list[-1])[:self.height_upper - 5, :]
 
     def select_thumbs(self, step_size=150):
-        if self.NO_GUI:
-            return
-            
         # Get sorted list of jpg files from extract directory
         extract_dir = Path(self.extract_dir)
         thumbs_dir = Path(self.thumbs_dir)
@@ -254,34 +267,42 @@ class ImageProcessor:
             print("No jpg files found in ./src/extract")
             return
             
-        current_idx = step_size - 1  # Start from step_size'th image (index step_size-1)
-        while current_idx < len(image_files):
-            # Show image number out of total
-            print(f"Image {current_idx + 1} of {len(image_files)}")
-            
-            # Read and display image
-            img = cv2.imread(str(image_files[current_idx]))
-            cv2.imshow('Image', img)
-            
-            # Wait for keypress
-            key = cv2.waitKey(0) & 0xFF
-            
-            if key == 13:  # Enter key
-                # Copy file to thumbs directory
-                dest_path = thumbs_dir / image_files[current_idx].name
-                shutil.copy2(image_files[current_idx], dest_path)
-                print(f"Copied {image_files[current_idx].name} to thumbs directory")
-                current_idx += step_size  # Move to next image
-            elif key == 83:  # Right arrow or 'd' key
-                current_idx += 1  # Move to next image
-            elif key == 81:  # Left arrow key
-                current_idx = max(0, current_idx - 1)  # Move to previous image, but not below 0
-            elif key == 27:  # ESC key
-                break
+        if self.NO_GUI:
+            # Save every step_size'th image
+            for idx in range(step_size-1, len(image_files), step_size):
+                dest_path = thumbs_dir / image_files[idx].name
+                shutil.copy2(image_files[idx], dest_path)
+                print(f"Copied {image_files[idx].name} to thumbs directory")
+        else:
+            current_idx = step_size - 1  # Start from step_size'th image (index step_size-1)
+            while current_idx < len(image_files):
+                # Show image number out of total
+                print(f"Image {current_idx + 1} of {len(image_files)}")
                 
-            # Check if we've reached the end
-            if current_idx >= len(image_files):
-                print("Reached end of images")
-                break
-        cv2.destroyAllWindows()
+                # Read and display image
+                img = cv2.imread(str(image_files[current_idx]))
+                cv2.imshow('Image', img)
+                
+                # Wait for keypress
+                key = cv2.waitKey(0) & 0xFF
+                
+                if key == 13:  # Enter key
+                    # Copy file to thumbs directory
+                    dest_path = thumbs_dir / image_files[current_idx].name
+                    shutil.copy2(image_files[current_idx], dest_path)
+                    print(f"Copied {image_files[current_idx].name} to thumbs directory")
+                    current_idx += step_size  # Move to next image
+                elif key == 83:  # Right arrow or 'd' key
+                    current_idx += 1  # Move to next image
+                elif key == 81:  # Left arrow key
+                    current_idx = max(0, current_idx - 1)  # Move to previous image, but not below 0
+                elif key == 27:  # ESC key
+                    break
+                    
+                # Check if we've reached the end
+                if current_idx >= len(image_files):
+                    print("Reached end of images")
+                    break
+            cv2.destroyAllWindows()
+            
         self.load_file_lists()

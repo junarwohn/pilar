@@ -6,19 +6,16 @@ import os
 import shutil
 import subprocess
 
-if __name__ == '__main__':
-    url = get_youtube_url()
-    if url:
-        print(url)
-
 class Downloader:
-    def __init__(self):
-        self.day_info = time.strftime('%Y-%m-%d', time.localtime())[2:]
-        self.extract_dir = f"./out/{self.day_info}/extract"
-        self.thumbs_dir = f"./out/{self.day_info}/thumbs"
-        pass
+    def __init__(self, output_path):
+        self.output_path = output_path
+        self.url = None
 
-    def download_video(self, url):
+    def download_video(self, url=None):
+        if url is None and self.url is None:
+            self.url = self.get_yn_url()
+            url = self.url
+            
         now = time.localtime() 
         now_formatted = time.strftime('%Y%m%d-%H%M%S', now)
         ret = False
@@ -26,7 +23,7 @@ class Downloader:
         ydl_opts = {
             'format': "bestvideo[ext=mp4][width=1920][height=1080][fps=60]",
             'merge_output_format': 'mp4',
-            'outtmpl': f'./out/{self.day_info}/src.mp4'
+            'outtmpl': self.output_path
         }
         
         with yt.YoutubeDL(ydl_opts) as ydl:
@@ -59,21 +56,3 @@ class Downloader:
         except Exception as e:
             print(f'Error: {e}')
             return None
-
-    def extract_frames(self, fps=2):
-        """Extract frames from video using ffmpeg"""
-        
-        # Clean up existing directories
-        for directory in [self.extract_dir, self.thumbs_dir]:
-            if os.path.exists(directory):
-                shutil.rmtree(directory)
-            os.makedirs(directory)
-
-        # Extract frames using ffmpeg
-        ffmpeg_cmd = [
-            'ffmpeg', 
-            '-i', f'./out/{self.day_info}/src.mp4',
-            '-vf', f'fps={fps}',
-            f'{self.extract_dir}/img%04d.jpg'
-        ]
-        subprocess.run(ffmpeg_cmd)

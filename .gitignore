@@ -266,3 +266,4 @@ src/thumbs/
 src/*mp4
 out/
 pilar-venv/
+config.ini
