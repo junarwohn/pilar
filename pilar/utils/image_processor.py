@@ -16,6 +16,20 @@ from pathlib import Path
 import numpy as np
 from datetime import datetime
 import subprocess
+import shutil
+import platform
+
+# 운영체제에 따른 화살표 키 코드 설정
+if platform.system() == "Windows":
+    RIGHT_ARROW = 2555904  # 오른쪽 화살표 (Windows)
+    LEFT_ARROW = 2424832   # 왼쪽 화살표 (Windows)
+elif platform.system() == "Linux":
+    RIGHT_ARROW = 65363    # 오른쪽 화살표 (Linux, X11 환경)
+    LEFT_ARROW = 65361     # 왼쪽 화살표 (Linux, X11 환경)
+else:
+    # 기본값(여기서는 Windows 값을 사용)
+    RIGHT_ARROW = 2555904
+    LEFT_ARROW = 2424832
 
 class ImageProcessor:
     def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False):
@@ -283,18 +297,20 @@ class ImageProcessor:
                 img = cv2.imread(str(image_files[current_idx]))
                 cv2.imshow('Image', img)
                 
-                # Wait for keypress
-                key = cv2.waitKey(0) & 0xFF
-                
+                # 키 입력 대기
+                key = cv2.waitKeyEx(0)
+                # 디버깅: 입력된 키 코드 출력 (필요에 따라 주석처리)
+                print("Key pressed:", key)
+
                 if key == 13:  # Enter key
                     # Copy file to thumbs directory
                     dest_path = thumbs_dir / image_files[current_idx].name
                     shutil.copy2(image_files[current_idx], dest_path)
                     print(f"Copied {image_files[current_idx].name} to thumbs directory")
                     current_idx += step_size  # Move to next image
-                elif key == 83:  # Right arrow or 'd' key
+                elif key == RIGHT_ARROW:  # Right arrow or 'd' key
                     current_idx += 1  # Move to next image
-                elif key == 81:  # Left arrow key
+                elif key == LEFT_ARROW:  # Left arrow key
                     current_idx = max(0, current_idx - 1)  # Move to previous image, but not below 0
                 elif key == 27:  # ESC key
                     break
