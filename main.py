@@ -18,17 +18,18 @@ if __name__ == "__main__":
     
     # Create base directory
     os.makedirs(base_dir, exist_ok=True)
-   
-    # Download video
+  
+    # # Download video
     downloader = Downloader(output_path=video_path)
     downloader.download_video()
 
-    # # Process images
+    # # # Process images
     processor = ImageProcessor(
         video_path=video_path,
         extract_dir=extract_dir,
         thumbs_dir=thumbs_dir,
-        no_gui=args.no_gui
+        no_gui=args.no_gui,
+        zoom=112
     )
     processor.select_thumbs()
     processor.get_bounds()

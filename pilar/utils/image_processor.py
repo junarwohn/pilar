@@ -32,12 +32,13 @@ else:
     LEFT_ARROW = 2424832
 
 class ImageProcessor:
-    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False):
+    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100):
         self.video_path = video_path
         self.extract_dir = extract_dir
         self.thumbs_dir = thumbs_dir
         self.IS_DEBUG = False
         self.NO_GUI = no_gui
+        self.zoom = zoom
         
         # Clean and create directories
         for directory in [self.extract_dir, self.thumbs_dir]:
@@ -153,7 +154,11 @@ class ImageProcessor:
         result_img = self.get_new_result_img()
         original_img = cv2.imread(f"{self.extract_dir}/" + self.file_list[0])
         pre_img = original_img[self.height_upper:self.height_lower, :]
+        # pre_img = cv2.resize(pre_img, dsize=(int(original_img.shape[1] * pre_img.shape[0] /  original_img.shape[0]), original_img.shape[0]))
+        pre_img = pre_img[:, int(pre_img.shape[1] * (self.zoom - 100) / 100 / 2) : int(pre_img.shape[1] * (1 - (self.zoom - 100) / 100 / 2))]
+        pre_img = cv2.resize(pre_img, dsize=(original_img.shape[1], int(original_img.shape[1] * pre_img.shape[0] /  original_img.shape[0])))
         pre_processed, pre_bin = self.process_image(pre_img)
+
 
         if not self.IS_DEBUG:
             self.file_list = tqdm(self.file_list)
@@ -161,10 +166,14 @@ class ImageProcessor:
         for file_name in self.file_list:
             original_img = cv2.imread(f"{self.extract_dir}/" + file_name)
             cur_img = original_img[self.height_upper:self.height_lower, :]
+            cur_img = cur_img[:, int(cur_img.shape[1] * (self.zoom - 100) / 100 / 2) : int(cur_img.shape[1] * (1 - (self.zoom - 100) / 100 / 2))]
+            # Resize image to same as original_img horizontal length
+            # cur_img = cv2.resize(cur_img, None, fx=original_img.shape[1] / cur_img.shape[1], fy=original_img.shape[1] / cur_img.shape[1])
+            # cur_img = cv2.resize(cur_img, dsize=(int(original_img.shape[1] * cur_img.shape[0] /  original_img.shape[0]), original_img.shape[0]))
+            cur_img = cv2.resize(cur_img, dsize=(original_img.shape[1], int(original_img.shape[1] * cur_img.shape[0] /  original_img.shape[0])))
             processed_img, cur_bin = self.process_image(cur_img)
-            
             cur_word = self.extract_text(processed_img)
-            if len(cur_word) < 2:
+            if len(cur_word) < 3:
                 continue
 
             if cur_word != self.pre_word:
@@ -185,7 +194,7 @@ class ImageProcessor:
                 result_img = self.handle_multiline(original_img, cur_img, cur_word, result_img)
                 
                 self.add_cnt += 1
-                if self.add_cnt % 25 == 0:
+                if self.add_cnt % 20 == 0:
                     self.save_result(result_img)
                     result_img = self.get_new_result_img()
 
@@ -193,7 +202,7 @@ class ImageProcessor:
             pre_img = cur_img
             pre_bin = cur_bin
 
-        if self.add_cnt % 25 != 0:
+        if self.add_cnt % 20 != 0:  
             self.save_result(result_img)
 
     def handle_differences(self, processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word):
@@ -242,7 +251,7 @@ class ImageProcessor:
         cur_img2 = original_img[2 * self.height_upper - self.height_lower:self.height_upper, :]
         processed_img2, _ = self.process_image(cur_img2)
         cur_word2 = self.extract_text(processed_img2)
-
+        
         if len(cur_word2) > len(cur_word):
             print("Check multiline")
             cv2.imshow("cur_img", cur_img)
