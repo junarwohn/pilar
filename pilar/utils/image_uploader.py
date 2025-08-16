@@ -32,7 +32,10 @@ class ImageUploader:
             else:  # Windows
                 user_data_dir = os.path.expanduser('~') + r'\AppData\Local\Google\Chrome\User Data'
             
-        self.chrome_options.add_argument(f'--user-data-dir={user_data_dir}')
+        # self.chrome_options.add_argument(f'--user-data-dir={user_data_dir}')
+        temp_profile = os.path.join(os.getcwd(), "chrome_temp")
+        self.chrome_options.add_argument(f'--user-data-dir={temp_profile}')
+
         self.chrome_options.add_argument(f'--profile-directory={profile_directory}')
         
         # Add arguments for stable automation

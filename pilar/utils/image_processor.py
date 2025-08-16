@@ -32,14 +32,15 @@ else:
     LEFT_ARROW = 2424832
 
 class ImageProcessor:
-    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100):
+    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2):
         self.video_path = video_path
         self.extract_dir = extract_dir
         self.thumbs_dir = thumbs_dir
         self.IS_DEBUG = False
         self.NO_GUI = no_gui
         self.zoom = zoom
-        
+        self.auto_detection_range = auto_detection_range
+
         # Clean and create directories
         for directory in [self.extract_dir, self.thumbs_dir]:
             if os.path.exists(directory):
@@ -72,7 +73,7 @@ class ImageProcessor:
         self.add_cnt = 0
         self.page_cnt = 0
         self.thumb_cnt = 0
-        self.pre_word = ""
+        self.pre_word = [""] 
 
     def load_file_lists(self):
         self.file_list = [i for i in os.listdir(self.extract_dir) if not i.startswith('.') and not 'Zone.Identifier' in i]
@@ -85,6 +86,9 @@ class ImageProcessor:
         data1 = img1.flatten()
         data2 = img2.flatten()
         return sum(np.isclose(data1, data2, atol=50)) / len(data1)
+
+    def get_subtilte_bounds(self):
+        pass
 
     def get_bounds(self):
         if self.NO_GUI:
@@ -176,11 +180,18 @@ class ImageProcessor:
             if len(cur_word) < 3:
                 continue
 
-            if cur_word != self.pre_word:
-                str_diff = SequenceMatcher(None, cur_word, self.pre_word).ratio()
+            if cur_word != self.pre_word[0]:
+                if isinstance([cur_word], list) and isinstance(self.pre_word, list):
+                    str_diff = max(
+                        SequenceMatcher(None, w1, w2).ratio()
+                        for w1 in [cur_word] for w2 in self.pre_word
+                    ) if [cur_word] and self.pre_word else 0
+                else:
+                    str_diff = SequenceMatcher(None, cur_word, self.pre_word[0]).ratio()
                 img_sim = self.img_similarity(pre_bin, cur_bin)
 
                 if self.handle_differences(processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word):
+                    print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
                     continue
 
                 print(f"\nDIFF, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
@@ -198,7 +209,8 @@ class ImageProcessor:
                     self.save_result(result_img)
                     result_img = self.get_new_result_img()
 
-            self.pre_word = cur_word
+            # self.pre_word = cur_word
+            self.pre_word = [cur_word]
             pre_img = cur_img
             pre_bin = cur_bin
 
@@ -223,7 +235,8 @@ class ImageProcessor:
             return True
         return False
 
-    def handle_production_mode(self, str_diff, img_sim, processed_img, cur_bin, pre_img, cur_img, cur_word):
+    # 기존 SVM 기반 코드는 handle_production_mode_backup으로 백업합니다.
+    def handle_production_mode_backup(self, str_diff, img_sim, processed_img, cur_bin, pre_img, cur_img, cur_word):
         vote = [clf.predict([[str_diff, img_sim]])[0] for clf in self.svm_clfs]
         if sum(vote) == 4:
             return True
@@ -240,6 +253,36 @@ class ImageProcessor:
             cv2.destroyAllWindows()
             if ok != 13:
                 self.pre_word = cur_word
+                print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                return True
+        return False
+
+    # str_diff만을 기준으로 비교하는 코드입니다.
+    def handle_production_mode(self, str_diff, img_sim, processed_img, cur_bin, pre_img, cur_img, cur_word):
+        if img_sim > 0.95:
+            # self.pre_word = cur_word
+            self.pre_word.append(cur_word)
+            return True
+        if str_diff <= 0.35:
+            return False
+        elif str_diff > 0.8:
+            # self.pre_word = cur_word   
+            self.pre_word.append(cur_word)   
+            return True
+        # NO_GUI 모드에서는 바로 False 반환
+        elif self.NO_GUI:
+            return False
+        else:
+            # GUI 모드에서는 사용자에게 확인받음
+            cv2.imshow("dst", processed_img)
+            cv2.imshow("cur_bin", cur_bin)
+            add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+            cv2.imshow("Okay to enter", add_img)
+            ok = cv2.waitKey(0)
+            cv2.destroyAllWindows()
+            if ok != 13:
+                # self.pre_word = [cur_word]
+                self.pre_word.append(cur_word)
                 print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
                 return True
         return False
@@ -331,3 +374,7 @@ class ImageProcessor:
             cv2.destroyAllWindows()
             
         self.load_file_lists()
+
+    def auto_process_files(self):
+        
+        pass

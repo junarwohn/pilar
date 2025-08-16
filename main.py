@@ -19,9 +19,11 @@ if __name__ == "__main__":
     # Create base directory
     os.makedirs(base_dir, exist_ok=True)
   
-    # # Download video
+    # Download video
     downloader = Downloader(output_path=video_path)
     downloader.download_video()
+
+    AUTO_DECTECTION = False
 
     # # # Process images
     processor = ImageProcessor(
@@ -29,12 +31,16 @@ if __name__ == "__main__":
         extract_dir=extract_dir,
         thumbs_dir=thumbs_dir,
         no_gui=args.no_gui,
-        zoom=112
+        zoom=112,
+        auto_detection_range=1/2
     )
     processor.select_thumbs()
-    processor.get_bounds()
-    processor.process_files()
-    
+
+    if not AUTO_DECTECTION:
+        processor.get_bounds()
+        processor.process_files()
+    else:
+        processor.auto_process_files()
     
     # Load config and upload processed images using Selenium
     config = configparser.ConfigParser()

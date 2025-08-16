@@ -35,6 +35,7 @@ class Downloader:
     def get_yn_url():
         day_info = time.strftime('%Y-%m-%d', time.localtime())[2:]
         url = f'http://www.youngnak.net/portfolio-item/bible-stroll-{day_info}'
+        #url = f'http://www.youngnak.net/portfolio-item/bible-stoll-{day_info}'
         # url = f'http://www.youngnak.net/portfolio-item/bible-storll-{day_info}'
         
         try:
