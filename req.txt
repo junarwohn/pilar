@@ -47,3 +47,4 @@ websocket-client==1.8.0
 websockets==14.1
 wsproto==1.2.0
 yt-dlp==2024.11.23.232923.dev0
+rapidfuzz==3.9.0
