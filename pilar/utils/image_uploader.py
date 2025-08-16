@@ -88,8 +88,8 @@ class ImageUploader:
         login_button.click()
         
     def upload_images(self):
-        # get current YY-MM-DD
-        current_date = datetime.now().strftime("%Y-%m-%d")  
+        # get current YYYY-MM-DD
+        current_date = datetime.now().strftime("%Y-%m-%d")
         # Read config file
         url = self.url
         driver = self.setup_driver()
