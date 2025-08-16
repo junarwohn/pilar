@@ -3,11 +3,15 @@ import argparse
 import time
 import os
 import configparser
+import logging
+import sys
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-gui', action='store_true', help='Run without GUI')
     args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO)
     
     # Set up directories
     day_info = time.strftime('%Y-%m-%d', time.localtime())[2:]
@@ -21,7 +25,11 @@ if __name__ == "__main__":
   
     # Download video
     downloader = Downloader(output_path=video_path)
-    downloader.download_video()
+    try:
+        downloader.download_video()
+    except ValueError as e:
+        logging.error("Video download skipped: %s", e)
+        sys.exit(1)
 
     AUTO_DETECTION = False
 
