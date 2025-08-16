@@ -5,6 +5,10 @@ import yt_dlp as yt
 import os
 import shutil
 import subprocess
+import logging
+
+
+logger = logging.getLogger(__name__)
 
 class Downloader:
     def __init__(self, output_path):
@@ -12,11 +16,16 @@ class Downloader:
         self.url = None
 
     def download_video(self, url=None):
-        if url is None and self.url is None:
-            self.url = self.get_yn_url()
+        if url is None:
+            if self.url is None:
+                self.url = self.get_yn_url()
             url = self.url
-            
-        now = time.localtime() 
+
+        if url is None:
+            logger.error("No download URL retrieved; skipping download")
+            raise ValueError("No download URL provided or found")
+
+        now = time.localtime()
         now_formatted = time.strftime('%Y%m%d-%H%M%S', now)
         ret = False
 
@@ -25,10 +34,10 @@ class Downloader:
             'merge_output_format': 'mp4',
             'outtmpl': self.output_path
         }
-        
+
         with yt.YoutubeDL(ydl_opts) as ydl:
             ret = ydl.download([url])
-        
+
         return ret, now_formatted
     
     @staticmethod
@@ -53,8 +62,8 @@ class Downloader:
             raise ValueError('No YouTube iframe found on page')
             
         except requests.RequestException as e:
-            print(f'Request failed: {e}')
+            logger.error(f'Request failed: {e}')
             return None
         except Exception as e:
-            print(f'Error: {e}')
+            logger.error(f'Error: {e}')
             return None
