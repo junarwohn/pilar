@@ -180,14 +180,15 @@ class ImageProcessor:
             if len(cur_word) < 3:
                 continue
 
-            if cur_word != self.pre_word[0]:
-                if isinstance([cur_word], list) and isinstance(self.pre_word, list):
-                    str_diff = max(
-                        SequenceMatcher(None, w1, w2).ratio()
-                        for w1 in [cur_word] for w2 in self.pre_word
-                    ) if [cur_word] and self.pre_word else 0
-                else:
-                    str_diff = SequenceMatcher(None, cur_word, self.pre_word[0]).ratio()
+            if not self.pre_word or cur_word != self.pre_word[0]:
+                str_diff = (
+                    max(
+                        SequenceMatcher(None, cur_word, prev_word).ratio()
+                        for prev_word in self.pre_word
+                    )
+                    if self.pre_word
+                    else 0
+                )
                 img_sim = self.img_similarity(pre_bin, cur_bin)
 
                 if self.handle_differences(processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word):
