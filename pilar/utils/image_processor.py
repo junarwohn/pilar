@@ -3,7 +3,7 @@ import cv2
 import os
 import re
 import numpy as np
-from difflib import SequenceMatcher
+from rapidfuzz.distance import Levenshtein
 import matplotlib.pyplot as plt
 from sklearn import svm
 import pickle
@@ -183,7 +183,7 @@ class ImageProcessor:
             if not self.pre_word or cur_word != self.pre_word[0]:
                 str_diff = (
                     max(
-                        SequenceMatcher(None, cur_word, prev_word).ratio()
+                        Levenshtein.normalized_similarity(cur_word, prev_word)
                         for prev_word in self.pre_word
                     )
                     if self.pre_word
