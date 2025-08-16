@@ -23,7 +23,7 @@ if __name__ == "__main__":
     downloader = Downloader(output_path=video_path)
     downloader.download_video()
 
-    AUTO_DECTECTION = False
+    AUTO_DETECTION = False
 
     # # # Process images
     processor = ImageProcessor(
@@ -36,7 +36,7 @@ if __name__ == "__main__":
     )
     processor.select_thumbs()
 
-    if not AUTO_DECTECTION:
+    if not AUTO_DETECTION:
         processor.get_bounds()
         processor.process_files()
     else:
