@@ -19,9 +19,10 @@ IS_DEDUG=False
 mod_path = 'svm_models.sav'
 svm_clfs = pickle.load(open(mod_path, 'rb'))
 def img_similarity(img1, img2):
-    data1 = img1.flatten()
-    data2 = img2.flatten()
-    return sum(np.isclose(data1, data2, atol=50)) / len(data1)
+    """Return similarity ratio between two binary images using OpenCV."""
+    diff = cv2.absdiff(img1, img2)
+    mask = (diff <= 50).astype(np.uint8)
+    return cv2.countNonZero(mask) / diff.size
 
 
 file_list = [i for i in os.listdir("src/extract/") if not i.startswith('.') and not 'Zone.Identifier' in i]

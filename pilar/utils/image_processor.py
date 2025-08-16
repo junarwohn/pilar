@@ -83,9 +83,22 @@ class ImageProcessor:
 
     @staticmethod
     def img_similarity(img1, img2):
-        data1 = img1.flatten()
-        data2 = img2.flatten()
-        return sum(np.isclose(data1, data2, atol=50)) / len(data1)
+        """Return similarity ratio between two binary images.
+
+        The original implementation compared flattened arrays with
+        ``np.isclose`` using an absolute tolerance of ``50``.  This
+        rewrite uses OpenCV operations for better performance:
+
+        1. ``cv2.absdiff`` computes the absolute per-pixel difference.
+        2. ``cv2.countNonZero`` counts pixels whose difference is within
+           the tolerance.
+
+        The result is the fraction of pixels considered similar.
+        """
+
+        diff = cv2.absdiff(img1, img2)
+        mask = (diff <= 50).astype(np.uint8)
+        return cv2.countNonZero(mask) / diff.size
 
     def get_subtilte_bounds(self):
         pass
