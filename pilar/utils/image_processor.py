@@ -1,4 +1,5 @@
-from pytesseract import *
+from tesserocr import PyTessBaseAPI, PSM, OEM
+from PIL import Image
 import cv2
 import os
 import re
@@ -40,6 +41,11 @@ class ImageProcessor:
         self.NO_GUI = no_gui
         self.zoom = zoom
         self.auto_detection_range = auto_detection_range
+
+        try:
+            self.engine = PyTessBaseAPI(lang='kor', oem=OEM.LSTM_ONLY, psm=PSM.SINGLE_COLUMN)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize tesseract engine: {e}")
 
         # Clean and create directories
         for directory in [self.extract_dir, self.thumbs_dir]:
@@ -163,8 +169,21 @@ class ImageProcessor:
         return bilateral_filter, binary
 
     def extract_text(self, img):
-        text = image_to_string(img, lang="kor", config="--psm 4 --oem 1")
-        word_list = re.sub(r"|[ ㄱㄴㄷㄹㅁㅂㅅㅇㅈㅊㅋㅌㅍㅎㅏㅕㅓㅕㅗㅛㅜㅠㅡㅣㅔㅐㅑㅒㅖㅘㅙㅚㅝㅞㅟㅢ{}\[\]/?.,;:|\)「＊ㆍ：\"…*~`!^\-_+<>@\#$%&》\\=\(\'\"\f]|[A-Za-z]", "", text).split('\n')
+        start = time.time()
+        try:
+            self.engine.SetImage(Image.fromarray(img))
+            text = self.engine.GetUTF8Text()
+            conf = self.engine.MeanTextConf()
+        except Exception as e:
+            print(f"OCR failed: {e}")
+            return ""
+        if self.IS_DEBUG:
+            elapsed = time.time() - start
+            print(f"OCR time: {elapsed:.3f}s, confidence: {conf}")
+        cleaned = re.sub(r"[^가-힣\n]", "", text)
+        word_list = [w for w in cleaned.split('\n') if w]
+        if not word_list or conf < 0:
+            return ""
         return max(word_list, key=len)
 
     def process_files(self):
