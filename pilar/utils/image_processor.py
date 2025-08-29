@@ -33,7 +33,7 @@ else:
     RIGHT_ARROW = 2555904
     LEFT_ARROW = 2424832
 
-TESSDATA_PATH=r"C:\Program Files\Tesseract-OCR\tessdata"
+TESSDATA_PATH=r"./res/"
 
 class ImageProcessor:
     def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2, fresh=True, fps: int = 2, prompt_handler=None, progress_callback=None):
