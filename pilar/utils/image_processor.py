@@ -19,6 +19,7 @@ from datetime import datetime
 import subprocess
 import shutil
 import platform
+import hashlib
 
 # 운영체제에 따른 화살표 키 코드 설정
 if platform.system() == "Windows":
@@ -32,8 +33,10 @@ else:
     RIGHT_ARROW = 2555904
     LEFT_ARROW = 2424832
 
+TESSDATA_PATH=r"C:\Program Files\Tesseract-OCR\tessdata"
+
 class ImageProcessor:
-    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2):
+    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2, fresh=True, fps: int = 2, prompt_handler=None, progress_callback=None):
         self.video_path = video_path
         self.extract_dir = extract_dir
         self.thumbs_dir = thumbs_dir
@@ -41,19 +44,36 @@ class ImageProcessor:
         self.NO_GUI = no_gui
         self.zoom = zoom
         self.auto_detection_range = auto_detection_range
+        self._init_fps = fps
+        # Optional callable that resolves ambiguous comparisons.
+        # Signature: prompt_handler(context: dict) -> bool (True means SAME/skip, False means DIFF/add)
+        self.prompt_handler = prompt_handler
+        # Optional progress reporter: progress_callback(cur: int, total: int, info: dict)
+        self.progress_callback = progress_callback
+        # Cache for ambiguous decisions to avoid repeated prompts on same word
+        self._decision_cache = {}  # word -> (is_same: bool, idx: int)
+        self._hash_decision_cache = {}  # content hash -> is_same
+        self._idx = 0
 
         try:
-            self.engine = PyTessBaseAPI(lang='kor', oem=OEM.LSTM_ONLY, psm=PSM.SINGLE_COLUMN)
+            self.engine = PyTessBaseAPI(path=TESSDATA_PATH, lang='kor', oem=OEM.LSTM_ONLY, psm=PSM.SINGLE_COLUMN)
         except Exception as e:
             raise RuntimeError(f"Failed to initialize tesseract engine: {e}")
 
-        # Clean and create directories
-        for directory in [self.extract_dir, self.thumbs_dir]:
-            if os.path.exists(directory):
-                shutil.rmtree(directory)
-            os.makedirs(directory)
-            
-        self.extract_frames()
+        # Clean and create directories (only when fresh)
+        if fresh:
+            for directory in [self.extract_dir, self.thumbs_dir]:
+                if os.path.exists(directory):
+                    shutil.rmtree(directory)
+                os.makedirs(directory)
+        else:
+            # Ensure directories exist but do not delete contents
+            os.makedirs(self.extract_dir, exist_ok=True)
+            os.makedirs(self.thumbs_dir, exist_ok=True)
+
+        # Extract frames only when fresh; otherwise reuse existing
+        if fresh:
+            self.extract_frames(fps=self._init_fps)
         self.load_models()
         self.init_parameters()
         self.load_file_lists()
@@ -195,11 +215,20 @@ class ImageProcessor:
         pre_img = cv2.resize(pre_img, dsize=(original_img.shape[1], int(original_img.shape[1] * pre_img.shape[0] /  original_img.shape[0])))
         pre_processed, pre_bin = self.process_image(pre_img)
 
-
+        total = len(self.file_list)
+        idx = 0
+        iterable = self.file_list
         if not self.IS_DEBUG:
-            self.file_list = tqdm(self.file_list)
+            iterable = tqdm(iterable)
 
-        for file_name in self.file_list:
+        for file_name in iterable:
+            idx += 1
+            self._idx = idx
+            if callable(self.progress_callback):
+                try:
+                    self.progress_callback(idx, total, {"pages": self.page_cnt, "added": self.add_cnt})
+                except Exception:
+                    pass
             original_img = cv2.imread(f"{self.extract_dir}/" + file_name)
             cur_img = original_img[self.height_upper:self.height_lower, :]
             cur_img = cur_img[:, int(cur_img.shape[1] * (self.zoom - 100) / 100 / 2) : int(cur_img.shape[1] * (1 - (self.zoom - 100) / 100 / 2))]
@@ -224,6 +253,10 @@ class ImageProcessor:
                 img_sim = self.img_similarity(pre_bin, cur_bin)
 
                 if self.handle_differences(processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word):
+                    # When user marks as SAME (skip), advance baseline so we don't get stuck
+                    self.pre_word = [cur_word]
+                    pre_img = cur_img
+                    pre_bin = cur_bin
                     print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
                     continue
 
@@ -292,6 +325,15 @@ class ImageProcessor:
 
     # str_diff만을 기준으로 비교하는 코드입니다.
     def handle_production_mode(self, str_diff, img_sim, processed_img, cur_bin, pre_img, cur_img, cur_word):
+        # Helper: content hash to identify near-identical frames regardless of OCR noise
+        def _hash_img(img: np.ndarray) -> str:
+            try:
+                h = hashlib.sha1()
+                h.update(img.shape.__repr__().encode('utf-8'))
+                h.update(img.tobytes())
+                return h.hexdigest()
+            except Exception:
+                return ""
         if img_sim > 0.95:
             # self.pre_word = cur_word
             self.pre_word.append(cur_word)
@@ -302,22 +344,56 @@ class ImageProcessor:
             # self.pre_word = cur_word   
             self.pre_word.append(cur_word)   
             return True
-        # NO_GUI 모드에서는 바로 False 반환
-        elif self.NO_GUI:
-            return False
-        else:
-            # GUI 모드에서는 사용자에게 확인받음
-            cv2.imshow("dst", processed_img)
-            cv2.imshow("cur_bin", cur_bin)
-            add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
-            cv2.imshow("Okay to enter", add_img)
-            ok = cv2.waitKey(0)
-            cv2.destroyAllWindows()
-            if ok != 13:
-                # self.pre_word = [cur_word]
+        # Check content-hash cache first
+        hkey = _hash_img(cur_bin)
+        if hkey and hkey in self._hash_decision_cache:
+            return bool(self._hash_decision_cache[hkey])
+
+        # Check cached decision for this word within a short horizon
+        cached = self._decision_cache.get(cur_word)
+        if cached is not None:
+            is_same_cached, last_idx = cached
+            if self._idx - last_idx <= 60:  # reuse decision within last ~60 frames
+                return bool(is_same_cached)
+        # Prefer prompt_handler when provided (web UI), otherwise fall back
+        if callable(self.prompt_handler):
+            overlay = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+            ctx = {
+                "processed_img": processed_img,
+                "cur_bin": cur_bin,
+                "pre_img": pre_img,
+                "cur_img": cur_img,
+                "overlay": overlay,
+                "str_diff": float(str_diff),
+                "img_sim": float(img_sim),
+                "cur_word": cur_word,
+            }
+            is_same = bool(self.prompt_handler(ctx))
+            # remember decision for this word
+            self._decision_cache[cur_word] = (is_same, self._idx)
+            if hkey:
+                self._hash_decision_cache[hkey] = is_same
+            if is_same:
                 self.pre_word.append(cur_word)
                 print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
                 return True
+            return False
+
+        # NO_GUI 모드에서는 바로 False 반환
+        if self.NO_GUI:
+            return False
+        # GUI 모드: OpenCV 창으로 확인
+        cv2.imshow("dst", processed_img)
+        cv2.imshow("cur_bin", cur_bin)
+        add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+        cv2.imshow("Okay to enter", add_img)
+        ok = cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        if ok != 13:
+            # self.pre_word = [cur_word]
+            self.pre_word.append(cur_word)
+            print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+            return True
         return False
 
     def handle_multiline(self, original_img, cur_img, cur_word, result_img):

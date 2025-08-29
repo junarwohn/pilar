@@ -1,3 +1,3 @@
 .\\pilar-venv\\Scripts\\activate
 
-python main.py
+python main.py --web --no-gui
