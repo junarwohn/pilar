@@ -3,8 +3,10 @@ import shutil
 import threading
 from pathlib import Path
 from datetime import datetime
+import time
 
 from flask import Flask, request, send_file, redirect, url_for, Response, jsonify
+import subprocess
 
 from pilar.utils.downloader import Downloader
 from pilar.utils.image_uploader import ImageUploader
@@ -38,6 +40,11 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             "decision": None,
         },
         "progress": {"current": 0, "total": 0, "pages": 0, "added": 0},
+        "extract": {
+            "running": False,
+            "last_log": "",
+            "progress": {"current": 0, "total": 0, "fps": fps},
+        },
     }
     cond = threading.Condition()
 
@@ -107,6 +114,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
               <h3 style='margin:4px 0 10px;'>Pilar Web Controller</h3>
               <div class='nav'>
                 <a class='btn secondary' href='{url_for('index')}'>Home</a>
+                <a class='btn secondary' href='{url_for('extract')}'>Extract</a>
                 <a class='btn secondary' href='{url_for('bounds')}'>Bounds</a>
                 <a class='btn secondary' href='{url_for('thumbs')}'>Thumbs</a>
                 <a class='btn secondary' href='{url_for('process_run')}'>Process</a>
@@ -142,9 +150,12 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
               <input name='url' placeholder='Leave empty to auto-detect from site'/>
               <button type='submit' class='mt-1'>Download Video</button>
             </form>
-            <form method='post' class='js-post' data-redirect='{url_for('index')}' action='{url_for('extract')}'>
+            <form method='post' class='js-post' data-redirect='{url_for('extract')}' action='{url_for('extract')}'>
               <label>Extract FPS:</label>
-              <input name='fps' type='number' value='{fps}' min='1' max='10'/>
+              <input name='fps' type='number' value='{fps}' min='1' max='60' style='width:100px;'/>
+              <label style='margin-left:8px;'>JPEG q (1-31):</label>
+              <input name='q' type='number' value='5' min='1' max='31' style='width:100px;'/>
+              <label style='margin-left:8px;'><input type='checkbox' name='hw' value='1'/> HW Accel</label>
               <button type='submit' class='mt-1'>Extract Frames</button>
             </form>
             <form method='post' class='js-post' data-redirect='{url_for('index')}' action='{url_for('auto_thumbs')}'>
@@ -159,7 +170,10 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             <form method='post' class='js-post' data-redirect='{url_for('process_run')}' action='{url_for('process_run')}'>
               <label><input type='checkbox' name='reextract' value='1'/> Re-extract frames</label>
               <label style='margin-left:8px;'>FPS:</label>
-              <input name='fps' type='number' value='{fps}' min='1' max='10' style='width:80px;'/>
+              <input name='fps' type='number' value='{fps}' min='1' max='60' style='width:80px;'/>
+              <label style='margin-left:8px;'>JPEG q:</label>
+              <input name='q' type='number' value='5' min='1' max='31' style='width:80px;'/>
+              <label style='margin-left:8px;'><input type='checkbox' name='hw' value='1'/> HW Accel</label>
               <button type='submit' class='mt-1'>Run Processing</button>
             </form>
             <p><a href='{url_for('results')}'>View Results</a></p>
@@ -177,16 +191,162 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             msg = f"Download failed: {e}"
         return redirect(url_for("index"))
 
-    @app.post("/extract")
-    def extract():
-        # Use ffmpeg directly to avoid tesseract dependency here
+    def _estimate_total_frames(fps_out: int) -> int:
         try:
-            for p in extract_dir.glob("*.jpg"):
-                p.unlink()
-            os.system(f"ffmpeg -y -i \"{video_path}\" -vf fps={request.form.get('fps', fps)} \"{extract_dir / 'img%04d.jpg'}\"")
+            import cv2
+            cap = cv2.VideoCapture(str(video_path))
+            if not cap.isOpened():
+                return 0
+            total_src = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            fps_src = cap.get(cv2.CAP_PROP_FPS) or 0
+            cap.release()
+            if fps_src and fps_src > 0:
+                duration = float(total_src) / float(fps_src)
+                return max(0, int(duration * fps_out))
+            return 0
         except Exception:
-            pass
-        return redirect(url_for("index"))
+            return 0
+
+    def _extract_job(fps_val: int, q_val: int, hw: bool):
+        try:
+            with cond:
+                state["extract"]["running"] = True
+                state["extract"]["last_log"] = "Starting extraction"
+                state["extract"]["progress"] = {"current": 0, "total": _estimate_total_frames(fps_val), "fps": fps_val}
+                cond.notify_all()
+
+            # Cleanup previous images
+            for p in extract_dir.glob("*.jpg"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+
+            # Build ffmpeg command
+            cmd = [
+                'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                '-threads', '0'
+            ]
+            if hw:
+                cmd += ['-hwaccel', 'auto']
+            cmd += [
+                '-i', str(video_path),
+                '-map', '0:v:0', '-an', '-sn', '-dn',
+                '-vf', f'fps={fps_val}',
+                '-q:v', str(q_val),
+                str(extract_dir / 'img%04d.jpg')
+            ]
+            proc = subprocess.Popen(cmd)
+
+            # Poll progress by counting files
+            while True:
+                ret = proc.poll()
+                cur = len(list(extract_dir.glob('*.jpg')))
+                with cond:
+                    pr = state["extract"]["progress"]
+                    total = pr.get("total", 0)
+                    state["extract"]["progress"] = {"current": int(cur), "total": int(total), "fps": fps_val}
+                    cond.notify_all()
+                if ret is not None:
+                    break
+                time.sleep(0.5)
+
+            # Final update
+            cur = len(list(extract_dir.glob('*.jpg')))
+            with cond:
+                pr = state["extract"]["progress"]
+                total = pr.get("total", 0)
+                state["extract"]["progress"] = {"current": int(cur), "total": int(total), "fps": fps_val}
+                state["extract"]["last_log"] = "Extraction completed"
+                state["extract"]["running"] = False
+                cond.notify_all()
+        except Exception as e:
+            with cond:
+                state["extract"]["last_log"] = f"Extraction error: {e}"
+                state["extract"]["running"] = False
+                cond.notify_all()
+
+    @app.route("/extract", methods=["GET", "POST"])
+    def extract():
+        if request.method == 'POST':
+            try:
+                fps_val = int(request.form.get('fps', fps))
+            except Exception:
+                fps_val = fps
+            try:
+                q_val = int(request.form.get('q', 5))
+            except Exception:
+                q_val = 5
+            hw = request.form.get('hw') == '1'
+            if not state["extract"]["running"]:
+                t = threading.Thread(target=_extract_job, args=(fps_val, q_val, hw), daemon=True)
+                t.start()
+        # Render Extract page with progress bar
+        prog = state["extract"]["progress"]
+        running = state["extract"]["running"]
+        try:
+            percent = int(prog.get("current", 0) * 100 / prog.get("total", 0)) if prog.get("total", 0) > 0 else 0
+        except Exception:
+            percent = 0
+        counts = f"frames: {prog.get('current', 0)}/{prog.get('total', 0)} | fps: {prog.get('fps', 0)}"
+        body = f"""
+        <div class='card'>
+          <div class='muted'>Extract Progress</div>
+          <div style='width:100%; background:#eee; border-radius:8px; overflow:hidden; height:14px;'>
+            <div id='bar' style='width:{percent}%; height:14px; background:#1f6feb;'></div>
+          </div>
+          <div class='muted mt-1' id='counts'>{counts}</div>
+        </div>
+        <form method='post' class='js-post mt-2' data-redirect='{url_for('extract')}' action='{url_for('extract')}'>
+          <label>FPS:</label>
+          <input name='fps' type='number' value='{prog.get('fps', fps)}' min='1' max='60' style='width:80px;'/>
+          <label style='margin-left:8px;'>JPEG q:</label>
+          <input name='q' type='number' value='5' min='1' max='31' style='width:80px;'/>
+          <label style='margin-left:8px;'><input type='checkbox' name='hw' value='1'/> HW Accel</label>
+          <button type='submit' class='mt-1'>{'Restart' if running else 'Start'} Extract</button>
+        </form>
+        <div class='mt-2'>
+          <a class='btn secondary' href='{url_for('thumbs')}'>Open Thumbs</a>
+          <a class='btn secondary' href='{url_for('process_run')}' style='margin-left:6px;'>Process</a>
+        </div>
+        <script>
+          async function pollExtract() {{
+            try {{
+              const r = await fetch('{url_for('extract_status')}');
+              const s = await r.json();
+              const bar = document.getElementById('bar');
+              const counts = document.getElementById('counts');
+              if (bar && s.percent !== undefined) {{
+                bar.style.width = (s.percent||0) + '%';
+              }}
+              if (counts && s.progress) {{
+                counts.textContent = `frames: ${{s.progress.current}}/${{s.progress.total}} | fps: ${{s.progress.fps}}`;
+              }}
+              if (s.running) {{
+                setTimeout(pollExtract, 2000);
+              }}
+            }} catch (e) {{
+              setTimeout(pollExtract, 3000);
+            }}
+          }}
+          pollExtract();
+        </script>
+        """
+        return page(body)
+
+    @app.get("/extract/status")
+    def extract_status():
+        prog = state["extract"].get("progress", {"current": 0, "total": 0, "fps": 0})
+        try:
+            percent = int(prog.get("current", 0) * 100 / prog.get("total", 0)) if prog.get("total", 0) > 0 else 0
+        except Exception:
+            percent = 0
+        return jsonify({
+            "running": state["extract"].get("running", False),
+            "message": state["extract"].get("last_log", ""),
+            "progress": prog,
+            "percent": percent,
+        })
 
     # Bounds
     @app.get("/bounds")
@@ -292,7 +452,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         return send_file(str(p), mimetype='image/jpeg')
 
     # Processing and upload
-    def _process_job(fresh: bool = False, fps_val: int = fps):
+    def _process_job(fresh: bool = False, fps_val: int = fps, q_val: int = 5, hwaccel: bool = False):
         try:
             state["processing"] = True
             # reset progress
@@ -354,6 +514,9 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 fps=fps_val,
                 prompt_handler=prompter,
                 progress_callback=progress,
+                ffmpeg_q=q_val,
+                ffmpeg_hwaccel=hwaccel,
+                ffmpeg_threads=0,
             )
             # Apply saved bounds
             proc.height_upper = int(state["bounds"]["upper"])
@@ -371,15 +534,22 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         # Parse UI options when POSTed
         fresh = False
         fps_val = fps
+        q_val = 5
+        hwaccel = False
         if request.method == 'POST':
             fresh = request.form.get('reextract') == '1'
             try:
                 fps_val = int(request.form.get('fps', fps))
             except Exception:
                 fps_val = fps
+            try:
+                q_val = int(request.form.get('q', 5))
+            except Exception:
+                q_val = 5
+            hwaccel = request.form.get('hw') == '1'
 
         if not state["processing"]:
-            t = threading.Thread(target=_process_job, args=(fresh, fps_val), daemon=True)
+            t = threading.Thread(target=_process_job, args=(fresh, fps_val, q_val, hwaccel), daemon=True)
             t.start()
         msg = "Running..." if state["processing"] else state["last_log"]
         # Initialize progress UI based on current state to avoid flashing 0%
@@ -520,8 +690,10 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         if not files:
             return page("<p>No results yet. Run processing first.</p>")
         items = []
+        names_js = []
         for p in files:
             name = p.name
+            names_js.append(name)
             items.append(
                 f"<div class='card'>"
                 f"  <a href='{url_for('result_image', name=name)}'>"
@@ -532,6 +704,25 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             )
         grid = "".join(items)
         body = f"""
+        <div class='mt-2'>
+          <a class='btn' href='{url_for('results_download')}'>Download All</a>
+          <a class='btn secondary' href='#' onclick='downloadResultsSeq();return false;' style='margin-left:6px;'>Download Each</a>
+        </div>
+        <script>
+          const RESULT_FILES = {names_js};
+          async function downloadResultsSeq() {{
+            const base = '{url_for('result_download')}';
+            for (const name of RESULT_FILES) {{
+              const a = document.createElement('a');
+              a.href = base + '?name=' + encodeURIComponent(name);
+              a.download = name;
+              document.body.appendChild(a);
+              a.click();
+              a.remove();
+              await new Promise(r => setTimeout(r, 200));
+            }}
+          }}
+        </script>
         <div class='grid'>
           {grid}
         </div>
@@ -547,6 +738,31 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         if not p.exists():
             return Response(status=404)
         return send_file(str(p), mimetype='image/jpeg')
+
+    @app.get("/result/download")
+    def result_download():
+        name = request.args.get('name')
+        if not name:
+            return Response(status=400)
+        p = base_path / name
+        if not p.exists():
+            return Response(status=404)
+        return send_file(str(p), mimetype='image/jpeg', as_attachment=True, download_name=name)
+
+    @app.get("/results/download")
+    def results_download():
+        import io, zipfile
+        files = sorted(base_path.glob('result-*.jpg'))
+        if not files:
+            return page("<p>No results to download.</p>")
+        ts = datetime.now().strftime('%Y%m%d-%H%M%S')
+        mem = io.BytesIO()
+        with zipfile.ZipFile(mem, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+            for p in files:
+                # Store with filename only inside zip
+                zf.write(p, arcname=p.name)
+        mem.seek(0)
+        return send_file(mem, mimetype='application/zip', as_attachment=True, download_name=f"results-{ts}.zip")
 
     @app.post("/shutdown")
     def shutdown():

@@ -36,7 +36,7 @@ else:
 TESSDATA_PATH=r"./res/"
 
 class ImageProcessor:
-    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2, fresh=True, fps: int = 2, prompt_handler=None, progress_callback=None):
+    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2, fresh=True, fps: int = 2, prompt_handler=None, progress_callback=None, ffmpeg_q: int = 5, ffmpeg_hwaccel: bool = False, ffmpeg_threads: int = 0):
         self.video_path = video_path
         self.extract_dir = extract_dir
         self.thumbs_dir = thumbs_dir
@@ -45,6 +45,10 @@ class ImageProcessor:
         self.zoom = zoom
         self.auto_detection_range = auto_detection_range
         self._init_fps = fps
+        # ffmpeg extraction options
+        self._ff_q = int(ffmpeg_q) if ffmpeg_q is not None else 5
+        self._ff_hw = bool(ffmpeg_hwaccel)
+        self._ff_threads = int(ffmpeg_threads) if ffmpeg_threads is not None else 0
         # Optional callable that resolves ambiguous comparisons.
         # Signature: prompt_handler(context: dict) -> bool (True means SAME/skip, False means DIFF/add)
         self.prompt_handler = prompt_handler
@@ -79,11 +83,20 @@ class ImageProcessor:
         self.load_file_lists()
 
     def extract_frames(self, fps=2):
-        """Extract frames from video using ffmpeg"""
+        """Extract frames from video using ffmpeg with performance options"""
         ffmpeg_cmd = [
-            'ffmpeg', 
+            'ffmpeg',
+            '-hide_banner', '-loglevel', 'error', '-y',
+        ]
+        if self._ff_threads is not None:
+            ffmpeg_cmd += ['-threads', str(self._ff_threads)]
+        if self._ff_hw:
+            ffmpeg_cmd += ['-hwaccel', 'auto']
+        ffmpeg_cmd += [
             '-i', self.video_path,
+            '-map', '0:v:0', '-an', '-sn', '-dn',
             '-vf', f'fps={fps}',
+            '-q:v', str(self._ff_q),
             f'{self.extract_dir}/img%04d.jpg'
         ]
         subprocess.run(ffmpeg_cmd)
