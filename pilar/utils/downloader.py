@@ -15,7 +15,7 @@ class Downloader:
         self.output_path = output_path
         self.url = None
 
-    def download_video(self, url=None):
+    def download_video(self, url=None, progress=None):
         if url is None:
             if self.url is None:
                 self.url = self.get_yn_url()
@@ -29,10 +29,31 @@ class Downloader:
         now_formatted = time.strftime('%Y%m%d-%H%M%S', now)
         ret = False
 
+        def _hook(d):
+            if progress is None:
+                return
+            # Map yt-dlp dict to a compact payload
+            status = d.get('status')
+            payload = {
+                'status': status,
+                'downloaded': d.get('downloaded_bytes') or 0,
+                'total': d.get('total_bytes') or d.get('total_bytes_estimate') or 0,
+                'speed': d.get('speed') or 0,
+                'eta': d.get('eta') or 0,
+                'filename': d.get('filename') or self.output_path,
+            }
+            try:
+                progress(payload)
+            except Exception:
+                pass
+
         ydl_opts = {
             'format': "bestvideo[ext=mp4][width=1920][height=1080][fps=60]",
             'merge_output_format': 'mp4',
-            'outtmpl': self.output_path
+            'outtmpl': self.output_path,
+            # Ensure we replace yesterday's file when a new day starts
+            'overwrites': True,
+            'progress_hooks': [_hook],
         }
 
         with yt.YoutubeDL(ydl_opts) as ydl:

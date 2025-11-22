@@ -1,4 +1,5 @@
 import os
+import re
 import shutil
 import threading
 from pathlib import Path
@@ -25,12 +26,37 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
     extract_dir.mkdir(exist_ok=True)
     thumbs_dir.mkdir(exist_ok=True)
 
+    # Ensure we rollover to a new day folder if the date changed while server is running.
+    def ensure_today_base():
+        nonlocal base_path, video_path, extract_dir, thumbs_dir
+        try:
+            today = datetime.now().strftime('%y-%m-%d')
+            target = base_path.parent / today
+            if target != base_path:
+                base_path = target
+                video_path = base_path / "src.mp4"
+                extract_dir = base_path / "extract"
+                thumbs_dir = base_path / "thumbs"
+                base_path.mkdir(parents=True, exist_ok=True)
+                extract_dir.mkdir(exist_ok=True)
+                thumbs_dir.mkdir(exist_ok=True)
+                # Reset thumbs navigation index for the new day
+                state["idx"] = state.get("step_size", 150) - 1
+        except Exception:
+            # Fail open: if anything goes wrong, keep existing base paths
+            pass
+
     # Simple in-memory state for thumbs navigation
     state = {
         "idx": step_size - 1,  # current index for thumbs selection
         "step_size": step_size,
         "processing": False,
         "last_log": "",
+        "download": {
+            "running": False,
+            "last_log": "",
+            "progress": {"downloaded": 0, "total": 0, "speed": 0, "eta": 0, "status": "idle"},
+        },
         "bounds": {"upper": 925, "lower": 1020},
         "review": {
             "pending": False,
@@ -131,9 +157,24 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
 
     @app.get("/")
     def index():
+        ensure_today_base()
         exists = video_path.exists()
         n_imgs = len(img_files())
         n_thumbs = len(list(thumbs_dir.glob("*.jpg")))
+        # Busy flags
+        downloading = state["download"]["running"]
+        extracting = state["extract"]["running"]
+        processing = state["processing"]
+        disable_download = 'disabled' if (downloading or processing or extracting) else ''
+        disable_extract = 'disabled' if (downloading or processing) else ''
+        disable_process = 'disabled' if (downloading) else ''
+        # Download progress snapshot
+        dprog = state["download"]["progress"]
+        try:
+            dpercent = int((dprog.get("downloaded", 0) * 100) / (dprog.get("total", 0) or 1)) if downloading else (100 if dprog.get("status") == 'finished' else 0)
+        except Exception:
+            dpercent = 0
+        dcounts = f"{dprog.get('downloaded', 0)//(1024*1024)}MB / {max(1, dprog.get('total', 0))//(1024*1024)}MB | eta: {dprog.get('eta', 0)}s"
         return page(
             f"""
             <div class='card'>
@@ -144,11 +185,18 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 <span class='muted' style='margin-left:10px;'><b>Thumbs</b>: {n_thumbs}</span>
               </div>
             </div>
+            <div class='card mt-2'>
+              <div class='muted'>Download Progress</div>
+              <div style='width:100%; background:#eee; border-radius:8px; overflow:hidden; height:14px;'>
+                <div id='dlbar' style='width:{dpercent}%; height:14px; background:#1f6feb;'></div>
+              </div>
+              <div class='muted mt-1' id='dlcounts'>{dcounts}</div>
+            </div>
             <hr/>
             <form method='post' class='js-post' data-redirect='{url_for('index')}' action='{url_for('download')}'>
               <label>YouTube URL (optional):</label><br/>
               <input name='url' placeholder='Leave empty to auto-detect from site'/>
-              <button type='submit' class='mt-1'>Download Video</button>
+              <button id='downloadBtn' type='submit' class='mt-1' {disable_download}>{'Downloading...' if downloading else 'Download Video'}</button>
             </form>
             <form method='post' class='js-post' data-redirect='{url_for('extract')}' action='{url_for('extract')}'>
               <label>Extract FPS:</label>
@@ -156,7 +204,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
               <label style='margin-left:8px;'>JPEG q (1-31):</label>
               <input name='q' type='number' value='5' min='1' max='31' style='width:100px;'/>
               <label style='margin-left:8px;'><input type='checkbox' name='hw' value='1'/> HW Accel</label>
-              <button type='submit' class='mt-1'>Extract Frames</button>
+              <button id='extractBtn' type='submit' class='mt-1' {disable_extract}>{'Extracting...' if extracting else 'Extract Frames'}</button>
             </form>
             <form method='post' class='js-post' data-redirect='{url_for('index')}' action='{url_for('auto_thumbs')}'>
               <label>Auto Thumbs step:</label>
@@ -174,22 +222,118 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
               <label style='margin-left:8px;'>JPEG q:</label>
               <input name='q' type='number' value='5' min='1' max='31' style='width:80px;'/>
               <label style='margin-left:8px;'><input type='checkbox' name='hw' value='1'/> HW Accel</label>
-              <button type='submit' class='mt-1'>Run Processing</button>
+              <button id='processBtn' type='submit' class='mt-1' {disable_process}>{'Running...' if processing else 'Run Processing'}</button>
             </form>
             <p><a href='{url_for('results')}'>View Results</a></p>
+            <script>
+              function setBusyUI(busy) {{
+                try {{
+                  const dlBtn = document.getElementById('downloadBtn');
+                  const exBtn = document.getElementById('extractBtn');
+                  const prBtn = document.getElementById('processBtn');
+                  if (dlBtn) {{
+                    dlBtn.disabled = !!busy;
+                    dlBtn.textContent = busy ? 'Downloading...' : 'Download Video';
+                  }}
+                  if (exBtn) {{ exBtn.disabled = !!busy; }}
+                  if (prBtn) {{ prBtn.disabled = !!busy; }}
+                }} catch (e) {{}}
+              }}
+              async function pollDownload() {{
+                try {{
+                  const r = await fetch('{url_for('download_status')}');
+                  const s = await r.json();
+                  const bar = document.getElementById('dlbar');
+                  const counts = document.getElementById('dlcounts');
+                  if (bar && (s.percent !== undefined)) {{
+                    bar.style.width = (s.percent||0) + '%';
+                  }}
+                  if (counts && s.progress) {{
+                    const p = s.progress;
+                    const mb = x => Math.floor((x||0) / (1024*1024));
+                    if (s.running) {{
+                      counts.textContent = `${{mb(p.downloaded)}}MB / ${{mb(p.total)}}MB | eta: ${{p.eta||0}}s`;
+                    }} else if ((s.percent||0) >= 100 || p.status === 'finished') {{
+                      counts.textContent = '다운로드 완료';
+                    }}
+                  }}
+                  setBusyUI(!!s.running);
+                  if (s.running) {{
+                    setTimeout(pollDownload, 1000);
+                  }}
+                }} catch (e) {{
+                  setTimeout(pollDownload, 2000);
+                }}
+              }}
+              pollDownload();
+            </script>
             """
         )
 
     @app.post("/download")
     def download():
         url = request.form.get("url") or None
-        dl = Downloader(output_path=str(video_path))
-        try:
-            dl.download_video(url=url)
-            msg = "Download requested."
-        except Exception as e:
-            msg = f"Download failed: {e}"
+        # Guards: do not start if already running or pipeline is busy
+        if state["download"]["running"] or state["processing"] or state["extract"]["running"]:
+            with cond:
+                state["last_log"] = "Busy: cannot start download now."
+            return redirect(url_for("index"))
+
+        def _download_job(url_val):
+            dl = Downloader(output_path=str(video_path))
+            def hook(info: dict):
+                with cond:
+                    state["download"]["progress"] = info
+                    cond.notify_all()
+            try:
+                with cond:
+                    state["download"]["running"] = True
+                    state["download"]["last_log"] = "Starting download"
+                    state["download"]["progress"] = {"downloaded": 0, "total": 0, "speed": 0, "eta": 0, "status": "starting"}
+                    cond.notify_all()
+                dl.download_video(url=url_val, progress=hook)
+                with cond:
+                    p = state["download"]["progress"]
+                    p["status"] = "finished"
+                    state["download"]["progress"] = p
+                    state["download"]["last_log"] = "Download completed"
+            except Exception as e:
+                with cond:
+                    state["download"]["last_log"] = f"Download error: {e}"
+            finally:
+                with cond:
+                    state["download"]["running"] = False
+                    cond.notify_all()
+
+        t = threading.Thread(target=_download_job, args=(url,), daemon=True)
+        t.start()
         return redirect(url_for("index"))
+
+    @app.get("/download/status")
+    def download_status():
+        prog = state["download"].get("progress", {})
+        downloaded = int(prog.get("downloaded", 0) or 0)
+        total = int(prog.get("total", 0) or 0)
+        percent = 0
+        try:
+            if total > 0:
+                percent = int(downloaded * 100 / total)
+            elif prog.get("status") == 'finished':
+                percent = 100
+        except Exception:
+            percent = 0
+        return jsonify({
+            "running": state["download"].get("running", False),
+            "progress": {
+                "downloaded": downloaded,
+                "total": total,
+                "speed": prog.get("speed", 0),
+                "eta": prog.get("eta", 0),
+                "status": prog.get("status", "idle"),
+            },
+            "percent": percent,
+            "message": state["download"].get("last_log", ""),
+        })
 
     def _estimate_total_frames(fps_out: int) -> int:
         try:
@@ -215,8 +359,13 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 state["extract"]["progress"] = {"current": 0, "total": _estimate_total_frames(fps_val), "fps": fps_val}
                 cond.notify_all()
 
-            # Cleanup previous images
+            # Cleanup previous images and thumbnails
             for p in extract_dir.glob("*.jpg"):
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            for p in thumbs_dir.glob("*.jpg"):
                 try:
                     p.unlink()
                 except Exception:
@@ -268,7 +417,13 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
 
     @app.route("/extract", methods=["GET", "POST"])
     def extract():
+        ensure_today_base()
         if request.method == 'POST':
+            # Guard: avoid starting extract while download is running
+            if state["download"]["running"]:
+                with cond:
+                    state["last_log"] = "Busy: wait for download to finish."
+                return redirect(url_for('extract'))
             try:
                 fps_val = int(request.form.get('fps', fps))
             except Exception:
@@ -394,6 +549,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
     # Thumbs navigation UI
     @app.get("/thumbs")
     def thumbs():
+        ensure_today_base()
         files = img_files()
         if not files:
             return page("<p>No extracted frames found. Please extract first.</p>")
@@ -415,6 +571,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
 
     @app.get("/thumbs/action/<action>")
     def thumb_action(action: str):
+        ensure_today_base()
         files = img_files()
         if not files:
             return redirect(url_for("thumbs"))
@@ -433,6 +590,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
 
     @app.post("/thumbs/auto")
     def auto_thumbs():
+        ensure_today_base()
         try:
             step = int(request.form.get("step", state["step_size"]))
             state["step_size"] = step
@@ -445,6 +603,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
 
     @app.get("/image")
     def image():
+        ensure_today_base()
         name = request.args.get("name")
         p = extract_dir / name
         if not p.exists():
@@ -452,6 +611,9 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         return send_file(str(p), mimetype='image/jpeg')
 
     # Processing and upload
+    def _result_files():
+        return sorted([p for p in base_path.glob('*.jpg') if re.match(r"^\d{6}_\d{2}\.jpg$", p.name)])
+
     def _process_job(fresh: bool = False, fps_val: int = fps, q_val: int = 5, hwaccel: bool = False):
         try:
             state["processing"] = True
@@ -531,12 +693,18 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
 
     @app.route("/process", methods=["GET", "POST"])
     def process_run():
+        ensure_today_base()
         # Parse UI options when POSTed
         fresh = False
         fps_val = fps
         q_val = 5
         hwaccel = False
         if request.method == 'POST':
+            # Guard: avoid starting processing while download is running
+            if state["download"]["running"]:
+                with cond:
+                    state["last_log"] = "Busy: wait for download to finish."
+                return redirect(url_for('process_run'))
             fresh = request.form.get('reextract') == '1'
             try:
                 fps_val = int(request.form.get('fps', fps))
@@ -635,7 +803,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             "processing": state["processing"],
             "awaiting": state["review"]["pending"],
             "message": state["last_log"],
-            "results": len(list(base_path.glob('result-*.jpg'))),
+            "results": len(_result_files()),
             "progress": prog,
             "percent": percent,
         })
@@ -686,7 +854,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
 
     @app.get("/results")
     def results():
-        files = sorted(base_path.glob('result-*.jpg'))
+        files = _result_files()
         if not files:
             return page("<p>No results yet. Run processing first.</p>")
         items = []
@@ -707,11 +875,34 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         <div class='mt-2'>
           <a class='btn' href='{url_for('results_download')}'>Download All</a>
           <a class='btn secondary' href='#' onclick='downloadResultsSeq();return false;' style='margin-left:6px;'>Download Each</a>
+          <label style='margin-left:10px;font-size:12px;color:#555;'>
+            Delay (ms):
+            <input type='number' id='dlDelay' min='0' step='100' value='1200' style='width:90px;padding:4px;'>
+          </label>
         </div>
         <script>
           const RESULT_FILES = {names_js};
+          function getDownloadDelay() {{
+            const el = document.getElementById('dlDelay');
+            let v = parseInt((el && el.value) || '1200', 10);
+            if (isNaN(v) || v < 0) v = 0;
+            return v;
+          }}
+
+          // Restore saved delay from localStorage
+          document.addEventListener('DOMContentLoaded', () => {{
+            const el = document.getElementById('dlDelay');
+            if (!el) return;
+            const saved = localStorage.getItem('downloadDelayMs');
+            if (saved !== null) el.value = saved;
+            el.addEventListener('change', () => {{
+              localStorage.setItem('downloadDelayMs', getDownloadDelay());
+            }});
+          }});
+
           async function downloadResultsSeq() {{
             const base = '{url_for('result_download')}';
+            const delay = getDownloadDelay();
             for (const name of RESULT_FILES) {{
               const a = document.createElement('a');
               a.href = base + '?name=' + encodeURIComponent(name);
@@ -719,7 +910,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
               document.body.appendChild(a);
               a.click();
               a.remove();
-              await new Promise(r => setTimeout(r, 200));
+              await new Promise(r => setTimeout(r, delay));
             }}
           }}
         </script>
@@ -752,7 +943,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
     @app.get("/results/download")
     def results_download():
         import io, zipfile
-        files = sorted(base_path.glob('result-*.jpg'))
+        files = _result_files()
         if not files:
             return page("<p>No results to download.</p>")
         ts = datetime.now().strftime('%Y%m%d-%H%M%S')

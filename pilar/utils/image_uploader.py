@@ -110,9 +110,10 @@ class ImageUploader:
         photo_input = wait.until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "input.custom.uploadInput"))
         )
-        # find all jpg in out/current_day/result-#.jpg
+        # find all result jpgs in YYMMDD_##.jpg format
         cwd = os.getcwd()
-        jpg_list = glob.glob(os.path.join(cwd, self.image_dir, "result-*.jpg"))
+        pattern = os.path.join(cwd, self.image_dir, "[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9].jpg")
+        jpg_list = glob.glob(pattern)
 
         # 첨부할 사진의 전체 경로를 지정 (예시: Windows 경로)
         photo_input.send_keys("\n".join(jpg_list))

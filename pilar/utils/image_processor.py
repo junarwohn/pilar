@@ -58,6 +58,8 @@ class ImageProcessor:
         self._decision_cache = {}  # word -> (is_same: bool, idx: int)
         self._hash_decision_cache = {}  # content hash -> is_same
         self._idx = 0
+        # Queue of ambiguous decisions to be reviewed later (processed before saving pages)
+        self._pending_ctxs = []  # list[dict]
 
         try:
             self.engine = PyTessBaseAPI(path=TESSDATA_PATH, lang='kor', oem=OEM.LSTM_ONLY, psm=PSM.SINGLE_COLUMN)
@@ -234,6 +236,82 @@ class ImageProcessor:
         if not self.IS_DEBUG:
             iterable = tqdm(iterable)
 
+        # Page assembly buffers (used in web/headless path with deferred review)
+        page_segments = []           # list of subtitle crop images for current page
+        page_words = []              # words corresponding to segments (for optional logging)
+        page_pending_indices = set() # indices within page_segments that are pending review
+
+        def _finalize_and_save_page():
+            """Finalize pending decisions, assemble and save a page image.
+
+            - Prompts user for queued ambiguous items (if prompt_handler provided)
+            - Removes segments marked as SAME from the page buffer
+            - Composes final image and writes it
+            - Resets page buffers
+            """
+            nonlocal result_img, page_segments, page_words, page_pending_indices
+
+            # Resolve pending ambiguous items just before saving
+            if callable(self.prompt_handler) and page_pending_indices:
+                # We iterate in the order they were queued
+                # Map each pending ctx to its then-current index; decisions to SAME will drop items
+                remove_indices = set()
+                for ctx in list(self._pending_ctxs):
+                    # Only handle items that belong to the current page (identified via page_index)
+                    pidx = ctx.get("page_index")
+                    if pidx is None:
+                        continue
+                    # Ask decision now
+                    is_same = bool(self.prompt_handler(ctx))
+                    if is_same:
+                        remove_indices.add(pidx)
+                if remove_indices:
+                    # Rebuild page buffers excluding removed segments
+                    kept_segments = []
+                    kept_words = []
+                    for i, (seg, w) in enumerate(zip(page_segments, page_words)):
+                        if i not in remove_indices:
+                            kept_segments.append(seg)
+                            kept_words.append(w)
+                    # Adjust global counters: previously we counted all adds; decrement removed
+                    removed_cnt = len(remove_indices)
+                    self.add_cnt = max(0, self.add_cnt - removed_cnt)
+                    page_segments = kept_segments
+                    page_words = kept_words
+                # Clear page-related pending marks
+                page_pending_indices.clear()
+                # Also clear consumed pending ctxs
+                self._pending_ctxs.clear()
+
+            if not page_segments:
+                # Nothing to save for this page
+                return
+
+            # Compose final page image: start from top template and stack segments
+            header = self.get_new_result_img()
+            composed = header
+            for seg in page_segments:
+                composed = np.vstack((composed, seg))
+            # Save page
+            # Write accepted words for this page into out/date/words.txt (append)
+            try:
+                os.makedirs(f"out/{datetime.now().strftime('%y-%m-%d')}", exist_ok=True)
+                with open(f"out/{datetime.now().strftime('%y-%m-%d')}/words.txt", "a", encoding="utf-8") as f:
+                    for w in page_words:
+                        f.write(f"{w}\n")
+            except OSError as e:
+                print(f"Error writing to file: {e}")
+
+            cv2.imwrite(str(Path(self.video_path).parent / f"{datetime.now().strftime('%y%m%d')}_{self.page_cnt + 1:02d}.jpg"), composed)
+            self.page_cnt += 1
+            self.thumb_cnt += 1
+            # Reset buffers for next page
+            page_segments = []
+            page_words = []
+            page_pending_indices = set()
+            # Reset result image base for next page
+            result_img = self.get_new_result_img()
+
         for file_name in iterable:
             idx += 1
             self._idx = idx
@@ -274,27 +352,55 @@ class ImageProcessor:
                     continue
 
                 print(f"\nDIFF, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
-                try:
-                    os.makedirs(f"out/{datetime.now().strftime('%y-%m-%d')}", exist_ok=True)
-                    with open(f"out/{datetime.now().strftime('%y-%m-%d')}/words.txt", "a", encoding="utf-8") as f:
-                        f.write(f"{cur_word}\n")
-                except OSError as e:
-                    print(f"Error writing to file: {e}")
-                
-                result_img = self.handle_multiline(original_img, cur_img, cur_word, result_img)
-                
-                self.add_cnt += 1
-                if self.add_cnt % 20 == 0:
-                    self.save_result(result_img)
-                    result_img = self.get_new_result_img()
+
+                # New behavior: if a prompt_handler exists (web/headless), treat ambiguous as DIFF now,
+                # queue context for later review, and defer prompting until just before saving the page.
+                if callable(self.prompt_handler) and self.NO_GUI:
+                    # Add segment to current page buffer
+                    page_index = len(page_segments)
+                    page_segments.append(cur_img)
+                    page_words.append(cur_word)
+                    # Determine ambiguity: use same thresholds as in handle_production_mode
+                    ambiguous = not (img_sim > 0.95 or str_diff <= 0.35 or str_diff > 0.8)
+                    if ambiguous:
+                        overlay = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+                        ctx = {
+                            "processed_img": processed_img,
+                            "cur_bin": cur_bin,
+                            "pre_img": pre_img,
+                            "cur_img": cur_img,
+                            "overlay": overlay,
+                            "str_diff": float(str_diff),
+                            "img_sim": float(img_sim),
+                            "cur_word": cur_word,
+                            "page_index": page_index,
+                        }
+                        self._pending_ctxs.append(ctx)
+                        page_pending_indices.add(page_index)
+                    # Update counters/progress
+                    self.add_cnt += 1
+                    # When page buffer reaches 20, resolve pending and save
+                    if len(page_segments) >= 20:
+                        _finalize_and_save_page()
+                else:
+                    # Legacy behavior (GUI or no prompt handler): immediate stacking
+                    result_img = self.handle_multiline(original_img, cur_img, cur_word, result_img)
+                    self.add_cnt += 1
+                    if self.add_cnt % 20 == 0:
+                        self.save_result(result_img)
+                        result_img = self.get_new_result_img()
 
             # self.pre_word = cur_word
             self.pre_word = [cur_word]
             pre_img = cur_img
             pre_bin = cur_bin
 
-        if self.add_cnt % 20 != 0:  
-            self.save_result(result_img)
+        # Flush remaining segments at the end
+        if callable(self.prompt_handler) and self.NO_GUI:
+            _finalize_and_save_page()
+        else:
+            if self.add_cnt % 20 != 0:
+                self.save_result(result_img)
 
     def handle_differences(self, processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word):
         if self.IS_DEBUG and not self.NO_GUI:
@@ -368,7 +474,13 @@ class ImageProcessor:
             is_same_cached, last_idx = cached
             if self._idx - last_idx <= 60:  # reuse decision within last ~60 frames
                 return bool(is_same_cached)
-        # Prefer prompt_handler when provided (web UI), otherwise fall back
+
+        # New behavior for web/headless: defer asking the user.
+        # Treat ambiguous as DIFF now and queue details for later in process_files().
+        if callable(self.prompt_handler) and self.NO_GUI:
+            return False
+
+        # Prefer prompt_handler immediately in GUI/interactive paths
         if callable(self.prompt_handler):
             overlay = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
             ctx = {
@@ -429,9 +541,12 @@ class ImageProcessor:
 
     def save_result(self, result_img):
         out_dir = Path(self.video_path).parent
-        img_path = f"{out_dir}/result-{str(self.page_cnt)}.jpg"
-        cv2.imwrite(img_path, result_img)
-        self.page_cnt += 1 
+        # Name results as YYMMDD_## (two-digit, 1-based index)
+        date_str = datetime.now().strftime('%y%m%d')
+        index = self.page_cnt + 1
+        img_path = out_dir / f"{date_str}_{index:02d}.jpg"
+        cv2.imwrite(str(img_path), result_img)
+        self.page_cnt += 1
         self.thumb_cnt += 1
 
     def get_new_result_img(self):
