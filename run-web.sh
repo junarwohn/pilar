@@ -17,4 +17,5 @@ echo "Starting Web UI on ${URL}"
 
 # Note: Do not auto-open a browser
 
-exec python3 main.py --web --no-gui --host 0.0.0.0 --port "${PORT}"
+# Use a single worker because in-memory state is not shared across workers.
+gunicorn -w 1 -k gthread --threads 8 --timeout 0 --bind 0.0.0.0:8000 pilar.web.wsgi:app

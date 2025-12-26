@@ -7,6 +7,7 @@ import os
 import re
 import numpy as np
 from rapidfuzz.distance import Levenshtein
+import csv
 import matplotlib.pyplot as plt
 from sklearn import svm
 import pickle
@@ -38,7 +39,7 @@ else:
 TESSDATA_PATH=r"./res/"  # Kept for compatibility; no longer used by PaddleOCR
 
 class ImageProcessor:
-    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2, fresh=True, fps: int = 2, prompt_handler=None, progress_callback=None, ffmpeg_q: int = 5, ffmpeg_hwaccel: bool = False, ffmpeg_threads: int = 0):
+    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2, fresh=True, fps: int = 2, prompt_handler=None, progress_callback=None, ffmpeg_q: int = 5, ffmpeg_hwaccel: bool = False, ffmpeg_threads: int = 0, stop_fn=None):
         self.video_path = video_path
         self.extract_dir = extract_dir
         self.thumbs_dir = thumbs_dir
@@ -56,10 +57,19 @@ class ImageProcessor:
         self.prompt_handler = prompt_handler
         # Optional progress reporter: progress_callback(cur: int, total: int, info: dict)
         self.progress_callback = progress_callback
+        # Optional stop function to allow graceful cancellation
+        self.stop_fn = (stop_fn if callable(stop_fn) else (lambda: False))
+        # Optional per-frame log file inside date folder
+        self._run_id = datetime.now().strftime('%Y%m%d-%H%M%S')
+        self._log_file = Path(self.video_path).parent / f"process-{self._run_id}.csv"
+        self._log_inited = False
         # Cache for ambiguous decisions to avoid repeated prompts on same word
         self._decision_cache = {}  # word -> (is_same: bool, idx: int)
         self._hash_decision_cache = {}  # content hash -> is_same
         self._idx = 0
+        # Track page header picks to encourage diversity
+        self._used_header_idxs: list[int] = []
+        self._last_header_idx: int | None = None
         # Queue of ambiguous decisions to be reviewed later (processed before saving pages)
         self._pending_ctxs = []  # list[dict]
         # OCR result cache keyed by binary content hash
@@ -79,6 +89,20 @@ class ImageProcessor:
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OCR engine: {e}")
 
+        # Optional FaceMesh for smart header picking (best-effort)
+        self._face_mesh = None
+        try:
+            import mediapipe as mp  # type: ignore
+            self._mp = mp
+            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
+                static_image_mode=True,
+                refine_landmarks=False,
+                max_num_faces=2,
+                min_detection_confidence=0.5,
+            )
+        except Exception:
+            self._mp = None
+
         # Clean and create directories (only when fresh)
         if fresh:
             for directory in [self.extract_dir, self.thumbs_dir]:
@@ -97,24 +121,71 @@ class ImageProcessor:
         self.init_parameters()
         self.load_file_lists()
 
+    def __del__(self):
+        try:
+            if getattr(self, "_face_mesh", None) is not None:
+                self._face_mesh.close()
+        except Exception:
+            pass
+
+    def _log_metrics(self, file_name: str, decision: str, img_sim: float | None, text_sim: float | None, prev_word: str, cur_word: str):
+        try:
+            out_dir = Path(self.video_path).parent
+            out_dir.mkdir(parents=True, exist_ok=True)
+            write_header = (not self._log_inited) and (not self._log_file.exists())
+            with open(self._log_file, 'a', encoding='utf-8', newline='') as fh:
+                w = csv.writer(fh)
+                if write_header:
+                    w.writerow(["time", "frame", "decision", "img_sim", "text_sim", "prev", "cur"])
+                w.writerow([
+                    datetime.now().strftime('%H:%M:%S'),
+                    file_name,
+                    decision,
+                    f"{img_sim:.3f}" if isinstance(img_sim, (int, float)) else "",
+                    f"{text_sim:.3f}" if isinstance(text_sim, (int, float)) else "",
+                    prev_word or "",
+                    cur_word or "",
+                ])
+            self._log_inited = True
+        except Exception as e:
+            # Logging must never break processing
+            try:
+                print(f"log error: {e}")
+            except Exception:
+                pass
+
     def extract_frames(self, fps=2):
         """Extract frames from video using ffmpeg with performance options"""
-        ffmpeg_cmd = [
-            'ffmpeg',
-            '-hide_banner', '-loglevel', 'error', '-y',
-        ]
-        if self._ff_threads is not None:
-            ffmpeg_cmd += ['-threads', str(self._ff_threads)]
-        if self._ff_hw:
-            ffmpeg_cmd += ['-hwaccel', 'auto']
-        ffmpeg_cmd += [
-            '-i', self.video_path,
-            '-map', '0:v:0', '-an', '-sn', '-dn',
-            '-vf', f'fps={fps}',
-            '-q:v', str(self._ff_q),
-            f'{self.extract_dir}/img%04d.jpg'
-        ]
-        subprocess.run(ffmpeg_cmd)
+        def build_cmd(use_hwaccel: bool):
+            cmd = [
+                'ffmpeg',
+                '-hide_banner', '-loglevel', 'error', '-y',
+            ]
+            if self._ff_threads is not None:
+                cmd += ['-threads', str(self._ff_threads)]
+            if use_hwaccel:
+                cmd += ['-hwaccel', 'auto']
+            cmd += [
+                '-i', self.video_path,
+                '-map', '0:v:0', '-an', '-sn', '-dn',
+                '-vf', f'fps={fps}',
+                '-q:v', str(self._ff_q),
+                f'{self.extract_dir}/img%04d.jpg'
+            ]
+            return cmd
+
+        # Try with HW accel if requested; fall back to software decode on failure
+        cmd = build_cmd(self._ff_hw)
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0 and self._ff_hw:
+            # Common failure on AV1: platform lacks HW decode; retry without hwaccel
+            try:
+                # Best-effort: retry without hwaccel
+                cmd_sw = build_cmd(False)
+                subprocess.run(cmd_sw, check=True)
+            except subprocess.CalledProcessError as e:
+                # Re-raise with helpful context
+                raise RuntimeError(f"ffmpeg failed (fallback as well). stderr: {e.stderr or res.stderr}")
 
     def load_models(self):
         mod_path = 'svm_models.sav'
@@ -143,12 +214,168 @@ class ImageProcessor:
         # Long text (>=6 chars)
         self.diff_lo_long = 0.60    # was 0.45 (user request)
         self.same_hi_long = 0.88    # was 0.85
+        # Smart header selection params
+        self.thumb_pick_window = 20
+        self.thumb_sharp_weight = 0.2
+        self.thumb_min_eye = 0.12
+        self.header_recent_k = 8
+        self.header_min_frame_gap = 120
 
     def load_file_lists(self):
         self.file_list = [i for i in os.listdir(self.extract_dir) if not i.startswith('.') and not 'Zone.Identifier' in i]
         self.file_list.sort()
         self.thumb_list = [i for i in os.listdir(self.thumbs_dir) if not i.startswith('.') and not 'Zone.Identifier' in i]
         self.thumb_list.sort()
+
+    # --- Auto bounds detection utilities ---
+    @staticmethod
+    def _longest_run(mask: np.ndarray, min_len: int = 20) -> tuple[int, int] | None:
+        """Return (start, end) indices of the longest contiguous True run in 1D mask.
+        end is exclusive. Returns None if no run meets min_len.
+        """
+        best_s, best_e = -1, -1
+        s = None
+        for i, v in enumerate(mask.astype(np.uint8)):
+            if v:
+                if s is None:
+                    s = i
+            else:
+                if s is not None:
+                    if i - s > (best_e - best_s):
+                        best_s, best_e = s, i
+                    s = None
+        if s is not None and (len(mask) - s) > (best_e - best_s):
+            best_s, best_e = s, len(mask)
+        if best_s >= 0 and (best_e - best_s) >= min_len:
+            return best_s, best_e
+        return None
+
+    @staticmethod
+    def _detect_bounds_one(gray: np.ndarray) -> tuple[int, int] | None:
+        """Detect subtitle band bounds in a single grayscale frame.
+
+        Heuristics tailored for white text over a dark rectangle near the bottom:
+        - Work on bottom ~55% ROI
+        - Enhance contrast (CLAHE)
+        - Combine darkness ratio and edge density per row to score candidate band
+        - Prefer long contiguous high-score run; fall back to edge-only
+        - Constrain to plausible height and vertical position
+        """
+        h, w = gray.shape[:2]
+        if h < 60 or w < 60:
+            return None
+
+        # ROI: bottom half+ (avoid mid-frame graphics)
+        roi_top = int(h * 0.45)
+        roi = gray[roi_top:, :]
+
+        # Contrast-limited adaptive histogram equalization for robustness
+        try:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            roi_eq = clahe.apply(roi)
+        except Exception:
+            roi_eq = roi
+
+        # Dark mask via Otsu on ROI
+        try:
+            _, dark = cv2.threshold(roi_eq, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        except Exception:
+            thr = int(np.quantile(roi_eq, 0.25))
+            thr = max(30, min(110, thr))
+            _, dark = cv2.threshold(roi_eq, thr, 255, cv2.THRESH_BINARY_INV)
+
+        # Edges (white glyphs on dark background → strong edges)
+        med = np.median(roi_eq)
+        lo = int(max(0, 0.66 * med))
+        hi = int(min(255, 1.33 * med))
+        edges = cv2.Canny(roi_eq, lo, hi)
+
+        # Row-wise metrics
+        dark_ratio = dark.mean(axis=1) / 255.0              # 0..1
+        edge_density = (edges.mean(axis=1) / 255.0)         # 0..1
+        # Score: prefer edges within dark regions; still allow edge-only for transparent subs
+        score = edge_density * (0.4 + 0.6 * dark_ratio)
+
+        # Smooth and threshold by quantiles
+        k = max(5, (h // 200) * 2 + 1)
+        score_s = cv2.GaussianBlur(score.astype(np.float32).reshape(-1, 1), (1, k), 0).ravel()
+        q = float(np.quantile(score_s, 0.75))
+        mask = score_s >= q
+        run = ImageProcessor._longest_run(mask, min_len=max(10, int(h * 0.03)))
+        if not run:
+            # Fallback: use edge density alone
+            q2 = float(np.quantile(edge_density, 0.80))
+            mask2 = edge_density >= q2
+            run = ImageProcessor._longest_run(mask2, min_len=max(10, int(h * 0.02)))
+            if not run:
+                return None
+
+        s, e = run
+        up = roi_top + s
+        lo = roi_top + e
+
+        # Plausible band height constraints
+        min_h = max(20, int(h * 0.06))
+        max_h = int(h * 0.22)
+        band_h = lo - up
+        if band_h < min_h:
+            # Expand around center
+            c = (up + lo) // 2
+            up = max(0, c - min_h // 2)
+            lo = min(h, up + min_h)
+        elif band_h > max_h:
+            # Shrink to max_h around center
+            c = (up + lo) // 2
+            up = max(0, c - max_h // 2)
+            lo = min(h, up + max_h)
+
+        # Vertical position sanity: subtitles near bottom third
+        center = 0.5 * (up + lo)
+        if center < h * 0.55:
+            # Too high → bias downwards same height
+            shift = int(h * 0.60 - center)
+            up = min(max(0, up + shift), h - 1)
+            lo = min(h, lo + shift)
+
+        # Clamp
+        up = int(max(0, min(up, h - 2)))
+        lo = int(max(up + 1, min(lo, h)))
+        return up, lo
+
+    @staticmethod
+    def auto_detect_bounds_from_dir(extract_dir: str, sample_count: int = 20) -> tuple[int, int] | None:
+        """Sample frames from extract_dir and estimate subtitle band bounds.
+        Returns (upper, lower) as image row indices (int) or None if not found.
+        """
+        try:
+            files = sorted([f for f in os.listdir(extract_dir) if f.lower().endswith('.jpg')])
+            if not files:
+                return None
+            n = len(files)
+            step = max(1, n // max(1, sample_count))
+            picks = [files[i] for i in range(0, n, step)][:sample_count]
+            ups, los = [], []
+            for name in picks:
+                p = os.path.join(extract_dir, name)
+                img = cv2.imread(p)
+                if img is None:
+                    continue
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                found = ImageProcessor._detect_bounds_one(gray)
+                if found:
+                    u, l = found
+                    ups.append(u)
+                    los.append(l)
+            if ups and los:
+                u = int(np.median(ups))
+                l = int(np.median(los))
+                # Basic sanity
+                if l - u < 20:
+                    l = u + 20
+                return u, l
+            return None
+        except Exception:
+            return None
 
     @staticmethod
     def img_similarity(img1, img2):
@@ -271,7 +498,8 @@ class ImageProcessor:
             except Exception:
                 sim_lev = 0.0
             try:
-                sim_partial = fuzz.partial_ratio(cur, prev) / 100.0
+                # De-emphasize partial match influence (x0.2)
+                sim_partial = (fuzz.partial_ratio(cur, prev) / 100.0) * 0.2
             except Exception:
                 sim_partial = 0.0
             # Space-insensitive Levenshtein
@@ -314,7 +542,10 @@ class ImageProcessor:
         return max(word_list, key=len)
 
     def process_files(self):
-        result_img = self.get_new_result_img()
+        # Guard: ensure frames exist
+        if not self.file_list:
+            raise RuntimeError("No extracted frames found. Run extraction first.")
+        result_img = self.get_new_result_img(center_idx=0)
         original_img = cv2.imread(f"{self.extract_dir}/" + self.file_list[0])
         pre_img = original_img[self.height_upper:self.height_lower, :]
         # pre_img = cv2.resize(pre_img, dsize=(int(original_img.shape[1] * pre_img.shape[0] /  original_img.shape[0]), original_img.shape[0]))
@@ -332,6 +563,7 @@ class ImageProcessor:
         page_segments = []           # list of subtitle crop images for current page
         page_words = []              # words corresponding to segments (for optional logging)
         page_pending_indices = set() # indices within page_segments that are pending review
+        page_header_img = None       # header image picked when the first subtitle of the page appears
 
         def _finalize_and_save_page():
             """Finalize pending decisions, assemble and save a page image.
@@ -341,7 +573,7 @@ class ImageProcessor:
             - Composes final image and writes it
             - Resets page buffers
             """
-            nonlocal result_img, page_segments, page_words, page_pending_indices
+            nonlocal result_img, page_segments, page_words, page_pending_indices, page_header_img
 
             # Resolve pending ambiguous items just before saving
             if callable(self.prompt_handler) and page_pending_indices:
@@ -379,8 +611,12 @@ class ImageProcessor:
                 # Nothing to save for this page
                 return
 
-            # Compose final page image: start from top template and stack segments
-            header = self.get_new_result_img()
+            # Compose final page image: use header chosen at page start if available
+            header = page_header_img if page_header_img is not None else self.get_new_result_img(center_idx=self._idx)
+            if page_header_img is None and getattr(self, '_last_header_idx', None) is not None:
+                self._used_header_idxs.append(self._last_header_idx)
+                if len(self._used_header_idxs) > 64:
+                    self._used_header_idxs = self._used_header_idxs[-64:]
             composed = header
             for seg in page_segments:
                 composed = np.vstack((composed, seg))
@@ -401,10 +637,17 @@ class ImageProcessor:
             page_segments = []
             page_words = []
             page_pending_indices = set()
-            # Reset result image base for next page
-            result_img = self.get_new_result_img()
+            page_header_img = None
+            # Reset result image base for next page (GUI path usage)
+            result_img = self.get_new_result_img(center_idx=self._idx)
 
         for file_name in iterable:
+            # Allow external stop request
+            try:
+                if self.stop_fn():
+                    break
+            except Exception:
+                pass
             idx += 1
             self._idx = idx
             if callable(self.progress_callback):
@@ -428,6 +671,9 @@ class ImageProcessor:
                 pre_bin = cur_bin
                 if self.IS_DEBUG:
                     print(f"Skip OCR (img_sim={img_sim_early:.3f} >= {self.sim_skip_threshold})")
+                # Log early skip (no OCR)
+                prev_word = self.pre_word[0] if self.pre_word else ""
+                self._log_metrics(file_name=file_name, decision="EARLY_SKIP", img_sim=img_sim_early, text_sim=None, prev_word=prev_word, cur_word="")
                 continue
 
             # Cache lookup by content hash to avoid repeated OCR on same binarized content
@@ -445,6 +691,8 @@ class ImageProcessor:
                 str_diff = self._compute_similarity(cur_word, self.pre_word) if self.pre_word else 0.0
                 img_sim = self.img_similarity(pre_bin, cur_bin)
 
+                # Reset manual flag for this comparison
+                self._last_manual = False
                 decision = self.handle_differences(
                     processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word, getattr(self, '_last_ocr_score', 0.0)
                 )
@@ -456,6 +704,10 @@ class ImageProcessor:
                     pre_img = cur_img
                     pre_bin = cur_bin
                     print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                    # Log metrics
+                    dec_label = "MANUAL_SAME" if getattr(self, "_last_manual", False) else "SAME"
+                    prev_word = self.pre_word[0] if self.pre_word else ""
+                    self._log_metrics(file_name=file_name, decision=dec_label, img_sim=img_sim, text_sim=str_diff, prev_word=prev_word, cur_word=cur_word)
                     # Reset ambiguous state
                     self._ambiguous_state = {"word": None, "count": 0}
                     continue
@@ -463,6 +715,9 @@ class ImageProcessor:
                 from_ambig = False
                 if decision == self.AMBIG:
                     print(f"\nAMBIGUOUS, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                    # Log metrics (ambiguous observation)
+                    prev_word = self.pre_word[0] if self.pre_word else ""
+                    self._log_metrics(file_name=file_name, decision="AMBIG", img_sim=img_sim, text_sim=str_diff, prev_word=prev_word, cur_word=cur_word)
                     # In headless + prompt_handler mode, only enqueue after hysteresis threshold
                     if callable(self.prompt_handler) and self.NO_GUI:
                         amb = self._ambiguous_state
@@ -484,12 +739,29 @@ class ImageProcessor:
 
                 if decision == self.DIFF:
                     print(f"\nDIFF, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                    # Log metrics
+                    dec_label = "MANUAL_DIFF" if getattr(self, "_last_manual", False) else "DIFF"
+                    prev_word = self.pre_word[0] if self.pre_word else ""
+                    self._log_metrics(file_name=file_name, decision=dec_label, img_sim=img_sim, text_sim=str_diff, prev_word=prev_word, cur_word=cur_word)
                     if callable(self.prompt_handler) and self.NO_GUI:
                         # Add segment to current page buffer; ambiguous ones reached threshold already
                         page_index = len(page_segments)
+                        # On first segment of a new page, choose a header within [-10 .. current] frames
+                        if page_index == 0 or page_header_img is None:
+                            try:
+                                cur_j = max(0, self._idx - 1)
+                                pick_j = self._pick_header_in_range(max(0, cur_j - 10), cur_j)
+                                img_h = cv2.imread(os.path.join(self.extract_dir, self.file_list[pick_j]))
+                                if img_h is not None:
+                                    page_header_img = img_h[:self.height_upper - 5, :]
+                                else:
+                                    page_header_img = None
+                            except Exception:
+                                page_header_img = None
                         page_segments.append(cur_img)
                         page_words.append(cur_word)
                         overlay = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+                        prev_word = (self.pre_word[0] if self.pre_word else "")
                         ctx = {
                             "processed_img": processed_img,
                             "cur_bin": cur_bin,
@@ -499,6 +771,8 @@ class ImageProcessor:
                             "str_diff": float(str_diff),
                             "img_sim": float(img_sim),
                             "cur_word": cur_word,
+                            "prev_word": prev_word,
+                            "text_sim": float(str_diff),
                             "page_index": page_index,
                         }
                         self._pending_ctxs.append(ctx)
@@ -514,10 +788,15 @@ class ImageProcessor:
                         self.add_cnt += 1
                         if self.add_cnt % 20 == 0:
                             self.save_result(result_img)
-                            result_img = self.get_new_result_img()
+                            result_img = self.get_new_result_img(center_idx=self._idx)
 
-            # self.pre_word = cur_word
-            # New substring detected (DIFF path handled above): reset baseline group
+            else:
+                # Same recognized text; log with perfect text similarity
+                img_sim_eq = self.img_similarity(pre_bin, cur_bin)
+                prev_word = self.pre_word[0] if self.pre_word else cur_word
+                self._log_metrics(file_name=file_name, decision="SAME_TEXT", img_sim=img_sim_eq, text_sim=1.0, prev_word=prev_word, cur_word=cur_word)
+
+            # New substring baseline (or same) — advance baseline images
             self.pre_word = [cur_word]
             pre_img = cur_img
             pre_bin = cur_bin
@@ -633,6 +912,7 @@ class ImageProcessor:
         # Prefer prompt_handler immediately in GUI/interactive paths
         if callable(self.prompt_handler):
             overlay = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+            prev_word = (self.pre_word[0] if self.pre_word else "")
             ctx = {
                 "processed_img": processed_img,
                 "cur_bin": cur_bin,
@@ -642,8 +922,11 @@ class ImageProcessor:
                 "str_diff": float(str_diff),
                 "img_sim": float(img_sim),
                 "cur_word": cur_word,
+                "prev_word": prev_word,
+                "text_sim": float(str_diff),
             }
             is_same = bool(self.prompt_handler(ctx))
+            self._last_manual = True
             # remember decision for this word
             self._decision_cache[cur_word] = (is_same, self._idx)
             if hkey:
@@ -702,11 +985,83 @@ class ImageProcessor:
         self.page_cnt += 1
         self.thumb_cnt += 1
 
-    def get_new_result_img(self):
+    def _header_score(self, img) -> tuple[float, float]:
         try:
-            return cv2.imread(f"{self.thumbs_dir}/" + self.thumb_list[self.thumb_cnt])[:self.height_upper - 5, :]
-        except:
-            return cv2.imread(f"{self.thumbs_dir}/" + self.thumb_list[-1])[:self.height_upper - 5, :]
+            from pilar.utils.smart_thumbs import _score_frame as _st_score
+            eye, sc = _st_score(img, face_mesh=self._face_mesh, sharp_w=self.thumb_sharp_weight)
+            return float(eye or 0.0), float(sc)
+        except Exception:
+            # Fallback: sharpness only
+            try:
+                g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                sharp = float(cv2.Laplacian(g, cv2.CV_64F).var())
+                sc = min(sharp, 500.0) / 500.0
+                return 0.0, sc
+            except Exception:
+                return 0.0, 0.0
+
+    def _pick_header_index(self, center_idx: int) -> int:
+        n = len(self.file_list)
+        if n == 0:
+            return 0
+        c = max(0, min(center_idx, n - 1))
+        lo = max(0, c - self.thumb_pick_window)
+        hi = min(n - 1, c + self.thumb_pick_window)
+        candidates = []  # (score, eye, j)
+        for j in range(lo, hi + 1):
+            try:
+                img = cv2.imread(os.path.join(self.extract_dir, self.file_list[j]))
+                if img is None:
+                    continue
+                eye, sc = self._header_score(img)
+            except Exception:
+                continue
+            candidates.append((float(sc), float(eye or 0.0), int(j)))
+        if not candidates:
+            return c
+        # Sort by score descending
+        candidates.sort(key=lambda t: t[0], reverse=True)
+        # Helper: far enough from recently used headers
+        recent = self._used_header_idxs[-self.header_recent_k:]
+        def far_enough(j: int) -> bool:
+            if not recent:
+                return True
+            return min(abs(j - r) for r in recent) >= self.header_min_frame_gap
+        # 1) eyes-open + far
+        for sc, eye, j in candidates:
+            if eye >= self.thumb_min_eye and far_enough(j):
+                return j
+        # 2) far only
+        for sc, eye, j in candidates:
+            if far_enough(j):
+                return j
+        # 3) fallback best overall
+        return int(candidates[0][2])
+
+    def get_new_result_img(self, center_idx: int | None = None):
+        # Primary: dynamic pick from extract frames near the given center
+        try:
+            if center_idx is None:
+                center_idx = max(0, min(self._idx, len(self.file_list)-1))
+            j = self._pick_header_index(center_idx)
+            self._last_header_idx = j
+            img = cv2.imread(os.path.join(self.extract_dir, self.file_list[j]))
+            if img is not None:
+                return img[:self.height_upper - 5, :]
+        except Exception:
+            pass
+        # Fallback: legacy thumbs list if available
+        try:
+            if self.thumb_list:
+                return cv2.imread(f"{self.thumbs_dir}/" + self.thumb_list[min(self.thumb_cnt, len(self.thumb_list)-1)])[:self.height_upper - 5, :]
+        except Exception:
+            pass
+        # Last resort: first frame top crop
+        try:
+            img = cv2.imread(os.path.join(self.extract_dir, self.file_list[0]))
+            return img[:self.height_upper - 5, :]
+        except Exception:
+            return np.zeros((max(1, self.height_upper - 5), 1, 3), dtype=np.uint8)
 
     def select_thumbs(self, step_size=150):
         # Get sorted list of jpg files from extract directory

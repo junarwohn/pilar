@@ -9,6 +9,8 @@
 out/
 pilar-venv/
 
+chrome_temp/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -73,3 +75,6 @@ pip-wheel-metadata/
 
 # Pyenv
 .python-version
+
+# Node
+node_modules/

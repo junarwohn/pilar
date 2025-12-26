@@ -47,8 +47,10 @@ class Downloader:
             except Exception:
                 pass
 
+        # Prefer H.264 (AVC) video to avoid AV1 decode overhead/compat issues.
+        # Falls back to best MP4 if AVC selection isn't available.
         ydl_opts = {
-            'format': "bestvideo[ext=mp4][width=1920][height=1080][fps=60]",
+            'format': "bv*[vcodec*=avc1][height<=1080][fps<=60]+ba[ext=m4a]/best[ext=mp4]",
             'merge_output_format': 'mp4',
             'outtmpl': self.output_path,
             # Ensure we replace yesterday's file when a new day starts
