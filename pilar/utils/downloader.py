@@ -65,28 +65,43 @@ class Downloader:
     
     @staticmethod
     def get_yn_url():
-        day_info = time.strftime('%Y-%m-%d', time.localtime())[2:]
-        url = f'http://www.youngnak.net/portfolio-item/bible-stroll-{day_info}'
-        #url = f'http://www.youngnak.net/portfolio-item/bible-stoll-{day_info}'
-        # url = f'http://www.youngnak.net/portfolio-item/bible-storll-{day_info}'
-        
-        try:
-            response = requests.get(url)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            iframes = soup.find_all('iframe')
-            
-            for iframe in iframes:
-                src = iframe.get('src', '')
-                if 'youtube' in src:
-                    return src
-                    
-            raise ValueError('No YouTube iframe found on page')
-            
-        except requests.RequestException as e:
-            logger.error(f'Request failed: {e}')
-            return None
-        except Exception as e:
-            logger.error(f'Error: {e}')
-            return None
+        now = time.localtime()
+        yy = f"{now.tm_year % 100:02d}"
+        # mm = f"{now.tm_mon:02d}"
+        mm = now.tm_mon
+        dd = now.tm_mday
+        day_info_candidates = [
+            f"{yy}-{mm:02d}-{dd:02d}",
+            f"{yy}-{mm}-{dd}",
+        ]
+        slug_candidates = [
+            "bible-stroll",
+            "bible-stoll",
+            "bible-storll",
+        ]
+
+        for day_info in day_info_candidates:
+            for slug in slug_candidates:
+                url = f'http://www.youngnak.net/portfolio-item/{slug}-{day_info}'
+                print(f"Try {url}...")
+                try:
+                    response = requests.get(url)
+                    if response.status_code != 200:
+                        continue
+
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    iframes = soup.find_all('iframe')
+
+                    for iframe in iframes:
+                        src = iframe.get('src', '')
+                        if 'youtube' in src:
+                            return src
+                except requests.RequestException as e:
+                    logger.warning(f'Request failed for {url}: {e}')
+                    continue
+                except Exception as e:
+                    logger.warning(f'Error parsing {url}: {e}')
+                    continue
+
+        logger.error('No valid YouTube iframe found for today')
+        return None

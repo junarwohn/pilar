@@ -203,6 +203,8 @@ class ImageProcessor:
         self.sim_skip_threshold = 0.985
         # Max width for OCR input to limit compute
         self.ocr_max_width = 1280
+        # User-tunable OCR scale (1.0 = original crop size)
+        self.ocr_scale = 1.0
         # Hysteresis: require consecutive ambiguous DIFF observations
         self.confirm_diff_frames = 2
         # Cache TTL in frames
@@ -518,8 +520,17 @@ class ImageProcessor:
     def extract_text(self, img):
         start = time.time()
         try:
-            # Downscale to max width for speed
+            # Downscale for speed (user scale first, then max width cap)
             h, w = img.shape[:2]
+            scale = float(getattr(self, "ocr_scale", 1.0) or 1.0)
+            if scale <= 0:
+                scale = 1.0
+            if scale != 1.0:
+                nw = max(1, int(w * scale))
+                nh = max(1, int(h * scale))
+                if nw != w or nh != h:
+                    img = cv2.resize(img, (nw, nh))
+                    h, w = img.shape[:2]
             if w > getattr(self, "ocr_max_width", 1280):
                 scale = self.ocr_max_width / float(w)
                 img = cv2.resize(img, (int(w * scale), int(h * scale)))

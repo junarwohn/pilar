@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 from datetime import datetime, timedelta
 import time
+import html
 
 from flask import Flask, request, send_file, redirect, url_for, Response, jsonify, stream_with_context
 import subprocess
@@ -57,6 +58,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         "step_size": step_size,
         "processing": False,
         "stop": False,
+        "ocr_scale": 1.0,
         "bounds_nav": {"src": "extract", "idx": 0},
         "last_log": "",
         "source_url": None,
@@ -122,6 +124,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 "bounds": state.get("bounds", {}),
                 "bounds_nav": state.get("bounds_nav", {"src": "thumbs", "idx": 0}),
                 "last_log": state.get("last_log", ""),
+                "ocr_scale": float(state.get("ocr_scale", 1.0)),
                 "progress": state.get("progress", {}),
                 "source_url": state.get("source_url"),
             }
@@ -141,6 +144,10 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             b = data.get("bounds")
             if isinstance(b, dict) and "upper" in b and "lower" in b:
                 state["bounds"] = {"upper": int(b["upper"]), "lower": int(b["lower"])}
+            try:
+                state["ocr_scale"] = float(data.get("ocr_scale", state.get("ocr_scale", 1.0)))
+            except Exception:
+                pass
             bn = data.get("bounds_nav")
             if isinstance(bn, dict):
                 state["bounds_nav"] = {"src": bn.get("src", "thumbs"), "idx": int(bn.get("idx", 0))}
@@ -161,6 +168,23 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             pass
 
     _load_state_subset()
+
+    # Lazy OCR engine for preview (avoid repeated heavy init)
+    _ocr_preview_engine = {"inst": None, "error": None}
+
+    def _get_ocr_engine():
+        if _ocr_preview_engine["error"]:
+            raise RuntimeError(_ocr_preview_engine["error"])
+        if _ocr_preview_engine["inst"] is None:
+            try:
+                from pilar.utils.ocr_engine import OCREngine
+                _ocr_preview_engine["inst"] = OCREngine(
+                    lang="korean", enable_angle_cls=False, cpu_threads=4, use_mkldnn=True
+                )
+            except Exception as e:
+                _ocr_preview_engine["error"] = str(e)
+                raise
+        return _ocr_preview_engine["inst"]
 
     # Daily scheduler: auto switch to today's date and run prepare frames at 06:00 local time
     def _seconds_until_next_6am(now: datetime | None = None) -> float:
@@ -1067,6 +1091,11 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         t_cur = files[t_idx] if files else None
         hu = int(request.args.get("upper", state["bounds"]["upper"]))
         hl = int(request.args.get("lower", state["bounds"]["lower"]))
+        try:
+            ocr_scale = float(state.get("ocr_scale", 1.0) or 1.0)
+        except Exception:
+            ocr_scale = 1.0
+        ocr_scale = max(0.1, min(1.0, ocr_scale))
         if request.method == 'POST':
             # Current values from form
             try:
@@ -1074,6 +1103,11 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 hl = int(request.form.get('lower', hl))
             except Exception:
                 pass
+            if 'ocr_scale' in request.form:
+                try:
+                    ocr_scale = float(request.form.get('ocr_scale', ocr_scale))
+                except Exception:
+                    pass
             act = request.form.get('act') or ''
             run_smart = request.form.get('run_smart') == '1'
             # Navigation for bounds preview
@@ -1103,6 +1137,15 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 state['bounds_nav'] = nav
                 _save_state_subset()
                 return redirect(url_for('preprocess'))
+            if act in ('ocr_scale_minus', 'ocr_scale_plus', 'ocr_scale_set'):
+                step = 0.05
+                if act == 'ocr_scale_minus':
+                    ocr_scale -= step
+                elif act == 'ocr_scale_plus':
+                    ocr_scale += step
+                ocr_scale = max(0.1, min(1.0, ocr_scale))
+                state["ocr_scale"] = ocr_scale
+                _save_state_subset()
             # Smart options (used only when run_smart)
             try:
                 st_step = int(request.form.get('step', state['step_size']))
@@ -1202,6 +1245,38 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             # final clamp (safety for preview values)
             hu = max(0, hu)
             hl = max(hu+1, hl)
+        # OCR preview for current crop
+        ocr_text = ""
+        ocr_elapsed = None
+        ocr_error = None
+        try:
+            import cv2 as _cv
+            if sample and sample.exists():
+                img = _cv.imread(str(sample))
+                if img is not None:
+                    hu2 = max(0, min(hu, img.shape[0]-1))
+                    hl2 = max(hu2 + 1, min(hl, img.shape[0]))
+                    crop = img[hu2:hl2, :]
+                    if ocr_scale <= 0:
+                        ocr_scale = 1.0
+                    if ocr_scale != 1.0:
+                        nw = max(1, int(crop.shape[1] * ocr_scale))
+                        nh = max(1, int(crop.shape[0] * ocr_scale))
+                        if nw != crop.shape[1] or nh != crop.shape[0]:
+                            crop = _cv.resize(crop, (nw, nh))
+                    start = time.time()
+                    try:
+                        engine = _get_ocr_engine()
+                        lines = engine.run_ocr_lines(crop)
+                        ocr_text = "\n".join([t for t, _ in lines])
+                    except Exception as e:
+                        ocr_error = str(e)
+                    ocr_elapsed = time.time() - start
+        except Exception as e:
+            ocr_error = str(e)
+        ocr_text_html = html.escape(ocr_text) if ocr_text else ""
+        ocr_time_label = f"{ocr_elapsed:.3f}s" if isinstance(ocr_elapsed, (int, float)) else "-"
+        ocr_error_html = html.escape(ocr_error) if ocr_error else ""
         body = f"""
         <div class='card'>
           <div class='section-title'>Subtitle Crop Bounds</div>
@@ -1243,6 +1318,31 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             </div>
             <div class='mt-2'>
               <button name='act' value='save' type='submit' class='btn'>Save</button>
+            </div>
+          </form>
+          <div class='mt-2'>
+            <div class='section-title'>OCR Info</div>
+            <div class='grid' style='grid-template-columns: 1fr 1fr; gap:12px;'>
+              <div class='card'>
+                <div class='muted'>OCR 결과</div>
+                <div style='white-space:pre-wrap; font-size:14px;'>{ocr_text_html or "인식 결과 없음"}</div>
+                <div class='muted mt-1' style='{("display:none;" if not ocr_error_html else "")}'>OCR 오류: {ocr_error_html}</div>
+              </div>
+              <div class='card'>
+                <div class='muted'>OCR 시간</div>
+                <div style='font-size:18px;'>{ocr_time_label}</div>
+              </div>
+            </div>
+          </div>
+          <form method='post' class='mt-2'>
+            <div class='card'>
+              <div class='muted'>OCR 해상도 비율 (original 대비 0.xx)</div>
+              <div class='mt-1' style='display:flex; gap:8px; align-items:center; flex-wrap:wrap;'>
+                <button name='act' value='ocr_scale_minus' type='submit' class='btn secondary'>-</button>
+                <input name='ocr_scale' type='number' step='0.01' min='0.10' max='1.00' value='{ocr_scale:.2f}' style='width:120px;'/>
+                <button name='act' value='ocr_scale_plus' type='submit' class='btn secondary'>+</button>
+                <button name='act' value='ocr_scale_set' type='submit' class='btn'>Apply</button>
+              </div>
             </div>
           </form>
         </div>
@@ -1550,6 +1650,10 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             # Apply saved bounds
             proc.height_upper = int(state["bounds"]["upper"])
             proc.height_lower = int(state["bounds"]["lower"])
+            try:
+                proc.ocr_scale = float(state.get("ocr_scale", 1.0) or 1.0)
+            except Exception:
+                proc.ocr_scale = 1.0
             # Bounds come from defaults in ImageProcessor unless thumbs influence them.
             proc.process_files()
             if state.get("stop"):
