@@ -9,8 +9,6 @@ import numpy as np
 from rapidfuzz.distance import Levenshtein
 import csv
 import matplotlib.pyplot as plt
-from sklearn import svm
-import pickle
 from tqdm import tqdm
 import time
 import os
@@ -117,7 +115,6 @@ class ImageProcessor:
         # Extract frames only when fresh; otherwise reuse existing
         if fresh:
             self.extract_frames(fps=self._init_fps)
-        self.load_models()
         self.init_parameters()
         self.load_file_lists()
 
@@ -186,10 +183,6 @@ class ImageProcessor:
             except subprocess.CalledProcessError as e:
                 # Re-raise with helpful context
                 raise RuntimeError(f"ffmpeg failed (fallback as well). stderr: {e.stderr or res.stderr}")
-
-    def load_models(self):
-        mod_path = 'svm_models.sav'
-        self.svm_clfs = pickle.load(open(mod_path, 'rb'))
 
     def init_parameters(self):
         self.height_upper = 925
@@ -857,28 +850,6 @@ class ImageProcessor:
             print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
             return self.SAME
         return self.DIFF
-
-    # 기존 SVM 기반 코드는 handle_production_mode_backup으로 백업합니다.
-    def handle_production_mode_backup(self, str_diff, img_sim, processed_img, cur_bin, pre_img, cur_img, cur_word):
-        vote = [clf.predict([[str_diff, img_sim]])[0] for clf in self.svm_clfs]
-        if sum(vote) == 4:
-            return True
-        elif sum(vote) == 0:
-            return False
-        elif self.NO_GUI:
-            return False
-        else:
-            cv2.imshow("dst", processed_img)
-            cv2.imshow("cur_bin", cur_bin)
-            add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
-            cv2.imshow("Okay to enter", add_img)
-            ok = cv2.waitKey(0)
-            cv2.destroyAllWindows()
-            if ok != 13:
-                self.pre_word = cur_word
-                print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
-                return True
-        return False
 
     # str_diff만을 기준으로 비교하는 코드입니다.
     def handle_production_mode(self, str_diff, img_sim, processed_img, cur_bin, pre_img, cur_img, cur_word, ocr_score: float = 0.0):

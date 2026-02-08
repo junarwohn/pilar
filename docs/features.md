@@ -31,9 +31,9 @@ How to run it: `python3 main.py` 또는 웹 UI의 Extract 단계.
 Inputs/Outputs: 입력 `out/YY-MM-DD/src.mp4`; 출력 `out/YY-MM-DD/extract/img%04d.jpg`.
 Notes: HW 가속 실패 시 소프트웨어 디코딩으로 폴백합니다. `fresh=True`인 경우에만 새로 추출합니다.
 
-**OCR / 텍스트 처리 (PaddleOCR + 휴리스틱 + SVM)**
-What it does: 자막 크롭 영역에 OCR을 수행하고, 정규화/한글 필터링 후 유사도+SVM 투표로 자막 변경 여부를 판정합니다.
-Where it lives: `pilar/utils/ocr_engine.py`, `pilar/utils/image_processor.py`, `svm_models.sav`, `classifier.py`(학습 스크립트).
+**OCR / 텍스트 처리 (PaddleOCR + 휴리스틱)**
+What it does: 자막 크롭 영역에 OCR을 수행하고, 정규화/한글 필터링 후 유사도 기반 휴리스틱으로 자막 변경 여부를 판정합니다.
+Where it lives: `pilar/utils/ocr_engine.py`, `pilar/utils/image_processor.py`.
 How to run it: `python3 main.py`(Process) 또는 웹 UI의 Process 단계.
 Inputs/Outputs: 입력 `out/YY-MM-DD/extract/*.jpg`; 출력 `out/YY-MM-DD/YYMMDD_##.jpg` 및 `out/YY-MM-DD/words.txt`.
 Notes: `paddleocr`와 `paddlepaddle`(CPU) 설치가 필요합니다. 동일 이미지 해시 기준 캐시를 사용해 OCR 중복을 줄입니다.
