@@ -674,8 +674,29 @@ class ImageProcessor:
             # cur_img = cv2.resize(cur_img, dsize=(int(original_img.shape[1] * cur_img.shape[0] /  original_img.shape[0]), original_img.shape[0]))
             cur_img = cv2.resize(cur_img, dsize=(original_img.shape[1], int(original_img.shape[1] * cur_img.shape[0] /  original_img.shape[0])))
             processed_img, cur_bin = self.process_image(cur_img)
+            # Scale for image-similarity comparison (match OCR scale from web UI)
+            def _scale_for_compare(img: np.ndarray) -> np.ndarray:
+                try:
+                    scale = float(getattr(self, "ocr_scale", 1.0) or 1.0)
+                except Exception:
+                    scale = 1.0
+                if scale <= 0:
+                    scale = 1.0
+                if scale == 1.0:
+                    return img
+                h, w = img.shape[:2]
+                nw = max(1, int(w * scale))
+                nh = max(1, int(h * scale))
+                if nw == w and nh == h:
+                    return img
+                # Use AREA for downscale, LINEAR for upscale
+                interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                return cv2.resize(img, (nw, nh), interpolation=interp)
+
+            pre_bin_cmp = _scale_for_compare(pre_bin)
+            cur_bin_cmp = _scale_for_compare(cur_bin)
             # Early skip: if images are near-identical, skip OCR entirely
-            img_sim_early = self.img_similarity(pre_bin, cur_bin)
+            img_sim_early = self.img_similarity(pre_bin_cmp, cur_bin_cmp)
             if img_sim_early >= getattr(self, "sim_skip_threshold", 0.985):
                 # Advance baseline and continue
                 pre_img = cur_img
@@ -700,7 +721,7 @@ class ImageProcessor:
             if not self.pre_word or cur_word != self.pre_word[0]:
                 # Compute similarity signals
                 str_diff = self._compute_similarity(cur_word, self.pre_word) if self.pre_word else 0.0
-                img_sim = self.img_similarity(pre_bin, cur_bin)
+                img_sim = self.img_similarity(pre_bin_cmp, cur_bin_cmp)
 
                 # Reset manual flag for this comparison
                 self._last_manual = False
