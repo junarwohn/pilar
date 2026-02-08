@@ -61,6 +61,8 @@ class ImageProcessor:
         self._run_id = datetime.now().strftime('%Y%m%d-%H%M%S')
         self._log_file = Path(self.video_path).parent / f"process-{self._run_id}.csv"
         self._log_inited = False
+        self._metrics_buffer = []
+        self._metrics_flush_interval = 128
         # Cache for ambiguous decisions to avoid repeated prompts on same word
         self._decision_cache = {}  # word -> (is_same: bool, idx: int)
         self._hash_decision_cache = {}  # content hash -> is_same
@@ -72,6 +74,8 @@ class ImageProcessor:
         self._pending_ctxs = []  # list[dict]
         # OCR result cache keyed by binary content hash
         self._ocr_cache = {}
+        # Negative OCR cache for repeated empty results (hash -> frame idx)
+        self._ocr_empty_cache = {}
         # Ambiguity hysteresis state
         self._ambiguous_state = {"word": None, "count": 0}
         # Tri-state decision codes
@@ -120,12 +124,20 @@ class ImageProcessor:
 
     def __del__(self):
         try:
+            self._flush_metrics(force=True)
+        except Exception:
+            pass
+        try:
             if getattr(self, "_face_mesh", None) is not None:
                 self._face_mesh.close()
         except Exception:
             pass
 
-    def _log_metrics(self, file_name: str, decision: str, img_sim: float | None, text_sim: float | None, prev_word: str, cur_word: str):
+    def _flush_metrics(self, force: bool = False):
+        if not self._metrics_buffer:
+            return
+        if not force and len(self._metrics_buffer) < self._metrics_flush_interval:
+            return
         try:
             out_dir = Path(self.video_path).parent
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -134,16 +146,27 @@ class ImageProcessor:
                 w = csv.writer(fh)
                 if write_header:
                     w.writerow(["time", "frame", "decision", "img_sim", "text_sim", "prev", "cur"])
-                w.writerow([
-                    datetime.now().strftime('%H:%M:%S'),
-                    file_name,
-                    decision,
-                    f"{img_sim:.3f}" if isinstance(img_sim, (int, float)) else "",
-                    f"{text_sim:.3f}" if isinstance(text_sim, (int, float)) else "",
-                    prev_word or "",
-                    cur_word or "",
-                ])
+                w.writerows(self._metrics_buffer)
             self._log_inited = True
+            self._metrics_buffer.clear()
+        except Exception as e:
+            try:
+                print(f"log error: {e}")
+            except Exception:
+                pass
+
+    def _log_metrics(self, file_name: str, decision: str, img_sim: float | None, text_sim: float | None, prev_word: str, cur_word: str):
+        try:
+            self._metrics_buffer.append([
+                datetime.now().strftime('%H:%M:%S'),
+                file_name,
+                decision,
+                f"{img_sim:.3f}" if isinstance(img_sim, (int, float)) else "",
+                f"{text_sim:.3f}" if isinstance(text_sim, (int, float)) else "",
+                prev_word or "",
+                cur_word or "",
+            ])
+            self._flush_metrics(force=False)
         except Exception as e:
             # Logging must never break processing
             try:
@@ -202,6 +225,8 @@ class ImageProcessor:
         self.confirm_diff_frames = 2
         # Cache TTL in frames
         self.cache_ttl_frames = 120
+        # TTL for negative OCR cache (empty OCR result re-try interval)
+        self.ocr_empty_ttl_frames = 30
         # Similarity thresholds (raised for higher OCR quality)
         # Short text (<6 chars)
         self.diff_lo_short = 0.50   # was 0.45
@@ -563,6 +588,27 @@ class ImageProcessor:
         if not self.IS_DEBUG:
             iterable = tqdm(iterable)
 
+        # Scale for image-similarity comparison (match OCR scale from web UI)
+        def _scale_for_compare(img: np.ndarray) -> np.ndarray:
+            try:
+                scale = float(getattr(self, "ocr_scale", 1.0) or 1.0)
+            except Exception:
+                scale = 1.0
+            if scale <= 0:
+                scale = 1.0
+            if scale == 1.0:
+                return img
+            h, w = img.shape[:2]
+            nw = max(1, int(w * scale))
+            nh = max(1, int(h * scale))
+            if nw == w and nh == h:
+                return img
+            # Use AREA for downscale, LINEAR for upscale
+            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+            return cv2.resize(img, (nw, nh), interpolation=interp)
+
+        pre_bin_cmp = _scale_for_compare(pre_bin)
+
         # Page assembly buffers (used in web/headless path with deferred review)
         page_segments = []           # list of subtitle crop images for current page
         page_words = []              # words corresponding to segments (for optional logging)
@@ -667,26 +713,6 @@ class ImageProcessor:
             # cur_img = cv2.resize(cur_img, dsize=(int(original_img.shape[1] * cur_img.shape[0] /  original_img.shape[0]), original_img.shape[0]))
             cur_img = cv2.resize(cur_img, dsize=(original_img.shape[1], int(original_img.shape[1] * cur_img.shape[0] /  original_img.shape[0])))
             processed_img, cur_bin = self.process_image(cur_img)
-            # Scale for image-similarity comparison (match OCR scale from web UI)
-            def _scale_for_compare(img: np.ndarray) -> np.ndarray:
-                try:
-                    scale = float(getattr(self, "ocr_scale", 1.0) or 1.0)
-                except Exception:
-                    scale = 1.0
-                if scale <= 0:
-                    scale = 1.0
-                if scale == 1.0:
-                    return img
-                h, w = img.shape[:2]
-                nw = max(1, int(w * scale))
-                nh = max(1, int(h * scale))
-                if nw == w and nh == h:
-                    return img
-                # Use AREA for downscale, LINEAR for upscale
-                interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-                return cv2.resize(img, (nw, nh), interpolation=interp)
-
-            pre_bin_cmp = _scale_for_compare(pre_bin)
             cur_bin_cmp = _scale_for_compare(cur_bin)
             # Early skip: if images are near-identical, skip OCR entirely
             img_sim_early = self.img_similarity(pre_bin_cmp, cur_bin_cmp)
@@ -694,6 +720,7 @@ class ImageProcessor:
                 # Advance baseline and continue
                 pre_img = cur_img
                 pre_bin = cur_bin
+                pre_bin_cmp = cur_bin_cmp
                 if self.IS_DEBUG:
                     print(f"Skip OCR (img_sim={img_sim_early:.3f} >= {self.sim_skip_threshold})")
                 # Log early skip (no OCR)
@@ -704,17 +731,24 @@ class ImageProcessor:
             # Cache lookup by content hash to avoid repeated OCR on same binarized content
             hkey = hashlib.sha1(cur_bin.tobytes()).hexdigest()
             cur_word = self._ocr_cache.get(hkey)
-            if not cur_word:
-                cur_word = self.extract_text(processed_img)
-                if cur_word:
-                    self._ocr_cache[hkey] = cur_word
+            if cur_word is None:
+                empty_last_idx = self._ocr_empty_cache.get(hkey, -10_000_000)
+                if (self._idx - empty_last_idx) <= getattr(self, "ocr_empty_ttl_frames", 30):
+                    cur_word = ""
+                else:
+                    cur_word = self.extract_text(processed_img)
+                    if cur_word:
+                        self._ocr_cache[hkey] = cur_word
+                        self._ocr_empty_cache.pop(hkey, None)
+                    else:
+                        self._ocr_empty_cache[hkey] = self._idx
             if len(cur_word) < 3:
                 continue
 
             if not self.pre_word or cur_word != self.pre_word[0]:
                 # Compute similarity signals
                 str_diff = self._compute_similarity(cur_word, self.pre_word) if self.pre_word else 0.0
-                img_sim = self.img_similarity(pre_bin_cmp, cur_bin_cmp)
+                img_sim = img_sim_early
 
                 # Reset manual flag for this comparison
                 self._last_manual = False
@@ -728,7 +762,9 @@ class ImageProcessor:
                     self.pre_word = ([baseline] + self.pre_word)[:3]
                     pre_img = cur_img
                     pre_bin = cur_bin
-                    print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                    pre_bin_cmp = cur_bin_cmp
+                    if self.IS_DEBUG:
+                        print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
                     # Log metrics
                     dec_label = "MANUAL_SAME" if getattr(self, "_last_manual", False) else "SAME"
                     prev_word = self.pre_word[0] if self.pre_word else ""
@@ -739,7 +775,8 @@ class ImageProcessor:
 
                 from_ambig = False
                 if decision == self.AMBIG:
-                    print(f"\nAMBIGUOUS, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                    if self.IS_DEBUG:
+                        print(f"\nAMBIGUOUS, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
                     # Log metrics (ambiguous observation)
                     prev_word = self.pre_word[0] if self.pre_word else ""
                     self._log_metrics(file_name=file_name, decision="AMBIG", img_sim=img_sim, text_sim=str_diff, prev_word=prev_word, cur_word=cur_word)
@@ -763,7 +800,8 @@ class ImageProcessor:
                         pass
 
                 if decision == self.DIFF:
-                    print(f"\nDIFF, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                    if self.IS_DEBUG:
+                        print(f"\nDIFF, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
                     # Log metrics
                     dec_label = "MANUAL_DIFF" if getattr(self, "_last_manual", False) else "DIFF"
                     prev_word = self.pre_word[0] if self.pre_word else ""
@@ -817,7 +855,7 @@ class ImageProcessor:
 
             else:
                 # Same recognized text; log with perfect text similarity
-                img_sim_eq = self.img_similarity(pre_bin, cur_bin)
+                img_sim_eq = img_sim_early
                 prev_word = self.pre_word[0] if self.pre_word else cur_word
                 self._log_metrics(file_name=file_name, decision="SAME_TEXT", img_sim=img_sim_eq, text_sim=1.0, prev_word=prev_word, cur_word=cur_word)
 
@@ -825,6 +863,7 @@ class ImageProcessor:
             self.pre_word = [cur_word]
             pre_img = cur_img
             pre_bin = cur_bin
+            pre_bin_cmp = cur_bin_cmp
 
         # Flush remaining segments at the end
         if callable(self.prompt_handler) and self.NO_GUI:
@@ -832,6 +871,7 @@ class ImageProcessor:
         else:
             if self.add_cnt % 20 != 0:
                 self.save_result(result_img)
+        self._flush_metrics(force=True)
 
     def handle_differences(self, processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word, ocr_score: float = 0.0):
         if self.IS_DEBUG and not self.NO_GUI:
@@ -937,7 +977,8 @@ class ImageProcessor:
             if is_same:
                 baseline = self.pre_word[0] if self.pre_word else cur_word
                 self.pre_word = ([baseline] + self.pre_word)[:3]
-                print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+                if self.IS_DEBUG:
+                    print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
                 return self.SAME
             return self.DIFF
 
@@ -956,7 +997,8 @@ class ImageProcessor:
             # self.pre_word = [cur_word]
             baseline = self.pre_word[0] if self.pre_word else cur_word
             self.pre_word = ([baseline] + self.pre_word)[:3]
-            print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
+            if self.IS_DEBUG:
+                print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
             return self.SAME
         return self.DIFF
 
