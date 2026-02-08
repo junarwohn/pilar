@@ -1,6 +1,7 @@
 import time
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 import yt_dlp as yt
 import os
 import shutil
@@ -63,45 +64,46 @@ class Downloader:
 
         return ret, now_formatted
     
+
     @staticmethod
     def get_yn_url():
-        now = time.localtime()
-        yy = f"{now.tm_year % 100:02d}"
-        # mm = f"{now.tm_mon:02d}"
-        mm = now.tm_mon
-        dd = now.tm_mday
-        day_info_candidates = [
-            f"{yy}-{mm:02d}-{dd:02d}",
-            f"{yy}-{mm}-{dd}",
-        ]
-        slug_candidates = [
-            "bible-stroll",
-            "bible-stoll",
-            "bible-storll",
-        ]
+        list_url = "https://www.youngnak.net/rev_kws_bible_stroll/"
+        print(f"Fetch list page {list_url}...")
+        try:
+            response = requests.get(list_url)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.warning(f"Request failed for {list_url}: {e}")
+            return None
 
-        for day_info in day_info_candidates:
-            for slug in slug_candidates:
-                url = f'http://www.youngnak.net/portfolio-item/{slug}-{day_info}'
-                print(f"Try {url}...")
-                try:
-                    response = requests.get(url)
-                    if response.status_code != 200:
-                        continue
+        soup = BeautifulSoup(response.text, 'html.parser')
+        container = soup.find(id="after_section_1")
+        link = None
+        if container is not None:
+            link_tag = container.select_one("section div div ul li:nth-of-type(1) h2 a")
+            if link_tag is not None:
+                link = link_tag.get("href")
 
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    iframes = soup.find_all('iframe')
+        if not link:
+            logger.error("No link found at expected XPath on list page")
+            return None
 
-                    for iframe in iframes:
-                        src = iframe.get('src', '')
-                        if 'youtube' in src:
-                            return src
-                except requests.RequestException as e:
-                    logger.warning(f'Request failed for {url}: {e}')
-                    continue
-                except Exception as e:
-                    logger.warning(f'Error parsing {url}: {e}')
-                    continue
+        detail_url = urljoin(list_url, link)
+        print(f"Try {detail_url}...")
+        try:
+            response = requests.get(detail_url)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logger.warning(f"Request failed for {detail_url}: {e}")
+            return None
 
-        logger.error('No valid YouTube iframe found for today')
+        soup = BeautifulSoup(response.text, 'html.parser')
+        iframes = soup.find_all('iframe')
+
+        for iframe in iframes:
+            src = iframe.get('src', '')
+            if 'youtube' in src:
+                return src
+
+        logger.error('No valid YouTube iframe found on detail page')
         return None
