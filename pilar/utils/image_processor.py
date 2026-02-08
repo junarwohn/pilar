@@ -757,16 +757,10 @@ class ImageProcessor:
                     if callable(self.prompt_handler) and self.NO_GUI:
                         # Add segment to current page buffer; ambiguous ones reached threshold already
                         page_index = len(page_segments)
-                        # On first segment of a new page, choose a header within [-10 .. current] frames
+                        # On first segment of a new page, use the same frame as the first subtitle
                         if page_index == 0 or page_header_img is None:
                             try:
-                                cur_j = max(0, self._idx - 1)
-                                pick_j = self._pick_header_in_range(max(0, cur_j - 10), cur_j)
-                                img_h = cv2.imread(os.path.join(self.extract_dir, self.file_list[pick_j]))
-                                if img_h is not None:
-                                    page_header_img = img_h[:self.height_upper - 5, :]
-                                else:
-                                    page_header_img = None
+                                page_header_img = original_img[:self.height_upper - 5, :]
                             except Exception:
                                 page_header_img = None
                         page_segments.append(cur_img)
@@ -795,6 +789,12 @@ class ImageProcessor:
                             _finalize_and_save_page()
                     else:
                         # Legacy behavior (GUI or no prompt handler): immediate stacking
+                        # Ensure header matches the first subtitle frame of the page
+                        if self.add_cnt % 20 == 0:
+                            try:
+                                result_img = original_img[:self.height_upper - 5, :]
+                            except Exception:
+                                pass
                         result_img = self.handle_multiline(original_img, cur_img, cur_word, result_img)
                         self.add_cnt += 1
                         if self.add_cnt % 20 == 0:

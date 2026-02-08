@@ -1566,6 +1566,16 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
     def _result_files():
         return sorted([p for p in base_path.glob('*.jpg') if re.match(r"^\d{6}_\d{2}\.jpg$", p.name)])
 
+    def _clear_results():
+        removed = 0
+        for p in _result_files():
+            try:
+                p.unlink()
+                removed += 1
+            except Exception:
+                pass
+        return removed
+
     def _process_job(fresh: bool = False, fps_val: int = fps, q_val: int = 5, hwaccel: bool = False):
         try:
             state["processing"] = True
@@ -1705,6 +1715,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             init_percent = 0
         init_counts = f"frames: {prog.get('current', 0)}/{prog.get('total', 0)} | pages: {prog.get('pages', 0)} | added: {prog.get('added', 0)}"
         has_results = len(_result_files()) > 0
+        disable_clear = "disabled" if (state.get("processing") or state["download"]["running"] or state["extract"]["running"] or state["smart_thumbs"]["running"]) else ""
         body = f"""
         <p id='pstatus'>Process status: {msg}</p>
         <div class='card'>
@@ -1717,6 +1728,9 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         <div class='nav mt-1'>
           {(f"<a class='btn secondary' href='{url_for('results')}'>Open Results</a>") if has_results else ""}
           {(f"<form method='post' action='{url_for('process_stop')}' class='js-post' data-redirect='{url_for('process_run')}'><button type='submit' class='btn warn' style='margin-left:8px;'>Stop</button></form>") if state.get('processing') else (f"<form method='post' action='{url_for('process_run')}' class='js-post' data-redirect='{url_for('process_run')}'><input type='hidden' name='start' value='1'/><button type='submit' class='btn' style='margin-left:8px;'>Run</button></form>")}
+          <form method='post' action='{url_for('results_clear')}' class='js-post' data-redirect='{url_for('process_run')}' data-confirm='오늘자 결과 이미지를 모두 삭제할까요?' style='margin-left:8px;'>
+            <button type='submit' class='btn warn' {disable_clear}>Clear Today Outputs</button>
+          </form>
         </div>
         <script>
           try {{
@@ -1897,6 +1911,9 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
           <a class='btn' href='{url_for('results_download')}'>Download All</a>
           <a class='btn secondary' href='#' onclick='downloadResultsSeq();return false;' style='margin-left:6px;'>Download Each</a>
           <a class='btn secondary' href='{url_for('results_viewer')}' style='margin-left:6px;'>iOS Viewer</a>
+          <form method='post' action='{url_for('results_clear')}' class='js-post' data-redirect='{url_for('results')}' data-confirm='오늘자 결과 이미지를 모두 삭제할까요?' style='display:inline-block;margin-left:6px;'>
+            <button type='submit' class='btn warn'>Clear Today Outputs</button>
+          </form>
           <label style='margin-left:10px;font-size:12px;color:#555;'>
             Delay (ms):
             <input type='number' id='dlDelay' min='0' step='100' value='1200' style='width:90px;padding:4px;'>
@@ -1941,6 +1958,19 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         </div>
         """
         return page(body)
+
+    @app.post("/results/clear")
+    def results_clear():
+        if state.get("processing") or state["download"]["running"] or state["extract"]["running"] or state["smart_thumbs"]["running"]:
+            with cond:
+                state["last_log"] = "Busy: stop running jobs before clearing outputs."
+                cond.notify_all()
+            return redirect(url_for("process_run"))
+        removed = _clear_results()
+        with cond:
+            state["last_log"] = f"Cleared {removed} result image(s) for today."
+            cond.notify_all()
+        return redirect(url_for("results") if _result_files() else url_for("process_run"))
 
     @app.get("/results/viewer")
     def results_viewer():
