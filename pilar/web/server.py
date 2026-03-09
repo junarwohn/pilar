@@ -2,6 +2,7 @@ import os
 import re
 import shutil
 import threading
+import configparser
 from pathlib import Path
 from datetime import datetime, timedelta
 import time
@@ -12,9 +13,9 @@ import subprocess
 import json
 
 from pilar.utils.downloader import Downloader
-from pilar.utils.image_uploader import ImageUploader
 from pilar.utils.image_processor import ImageProcessor
 from pilar.utils.smart_thumbs import smart_auto_thumbs
+from scripts.kakao_admin_uploader import upload_to_kakao
 
 
 def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2, step_size: int = 150):
@@ -59,6 +60,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         "processing": False,
         "stop": False,
         "ocr_scale": 1.0,
+        "process_debug": False,
         "bounds_nav": {"src": "extract", "idx": 0},
         "last_log": "",
         "source_url": None,
@@ -85,6 +87,10 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             "running": False,
             "last_log": "",
             "progress": {"current": 0, "total": 0, "fps": fps},
+        },
+        "upload": {
+            "running": False,
+            "last_log": "",
         },
     }
     cond = threading.Condition()
@@ -125,6 +131,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 "bounds_nav": state.get("bounds_nav", {"src": "thumbs", "idx": 0}),
                 "last_log": state.get("last_log", ""),
                 "ocr_scale": float(state.get("ocr_scale", 1.0)),
+                "process_debug": bool(state.get("process_debug", False)),
                 "progress": state.get("progress", {}),
                 "source_url": state.get("source_url"),
             }
@@ -148,6 +155,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 state["ocr_scale"] = float(data.get("ocr_scale", state.get("ocr_scale", 1.0)))
             except Exception:
                 pass
+            state["process_debug"] = bool(data.get("process_debug", state.get("process_debug", False)))
             bn = data.get("bounds_nav")
             if isinstance(bn, dict):
                 state["bounds_nav"] = {"src": bn.get("src", "thumbs"), "idx": int(bn.get("idx", 0))}
@@ -186,7 +194,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 raise
         return _ocr_preview_engine["inst"]
 
-    # Daily scheduler: auto switch to today's date and run prepare frames at 06:00 local time
+    # Daily scheduler: auto switch to today's date and run full pipeline at 06:00 local time
     def _seconds_until_next_6am(now: datetime | None = None) -> float:
         try:
             now = now or datetime.now()
@@ -207,14 +215,45 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             try:
                 ensure_today_base()
                 with cond:
-                    state["last_log"] = "Daily 06:00 auto refresh + prepare starting"
+                    state["last_log"] = "Daily 06:00 auto pipeline starting (download -> process -> upload)"
                     cond.notify_all()
-                # Start prepare frames (download + extract) if not busy
-                ok = start_download_extract(None, fps, 5, False)
+                # Step 1) Download + Extract
+                prepare_done = threading.Event()
+                ok = start_download_extract(None, fps, 5, False, done_event=prepare_done)
                 if not ok:
                     with cond:
                         state["last_log"] = "Daily run skipped: pipeline busy"
                         cond.notify_all()
+                    time.sleep(5)
+                    continue
+
+                # Wait until prepare phase actually completes.
+                # Using an event avoids races where running flags are not yet set.
+                while not prepare_done.wait(timeout=1.0):
+                    pass
+
+                if not list(extract_dir.glob("*.jpg")):
+                    with cond:
+                        state["last_log"] = "Daily run stopped: no extracted frames after prepare."
+                        cond.notify_all()
+                    time.sleep(5)
+                    continue
+
+                # Step 2) Process
+                with cond:
+                    state["last_log"] = "Daily run: processing images..."
+                    cond.notify_all()
+                _process_job(fresh=False, fps_val=fps, q_val=5, hwaccel=False, debug_review=False)
+
+                if not _result_files():
+                    with cond:
+                        state["last_log"] = "Daily run stopped: no result images to upload."
+                        cond.notify_all()
+                    time.sleep(5)
+                    continue
+
+                # Step 3) Upload (auto run disallows manual-login mode)
+                _run_upload_job(allow_manual_login=False)
                 # Avoid immediate retrigger in case clock skew; short nap
                 time.sleep(5)
             except Exception:
@@ -277,6 +316,12 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 "awaiting": bool(state.get("review", {}).get("pending", False)),
                 "progress": {"current": int(p.get("current", 0) or 0), "total": int(p.get("total", 0) or 0), "pages": int(p.get("pages", 0) or 0), "added": int(p.get("added", 0) or 0)},
                 "percent": ppercent,
+            }
+            # Upload
+            up = state.get("upload", {})
+            snap["upload"] = {
+                "running": bool(up.get("running", False)),
+                "last_log": str(up.get("last_log", "") or ""),
             }
             snap["message"] = state.get("last_log", "")
             snap["results"] = len(_result_files()) if ' _result_files' in globals() or True else 0
@@ -348,6 +393,38 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 auto = None
             state["auto_url"] = auto
         return auto
+
+    def _str_to_bool(value: str | None, default: bool) -> bool:
+        if value is None:
+            return default
+        v = value.strip().lower()
+        if v in {"1", "true", "yes", "y", "on"}:
+            return True
+        if v in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
+
+    def _load_upload_settings() -> dict:
+        cfg_path = Path("user_config.ini").resolve()
+        parser = configparser.ConfigParser()
+        parser.read(cfg_path, encoding="utf-8")
+        if "global" not in parser:
+            raise KeyError(f"[global] section not found in {cfg_path}")
+        g = parser["global"]
+        kakao_url = (g.get("kakao_url") or "").strip()
+        if not kakao_url:
+            raise ValueError("Set [global] kakao_url in user_config.ini")
+        return {
+            "url": kakao_url,
+            "headless": _str_to_bool(g.get("headless"), True),
+            "manual_login": _str_to_bool(g.get("manual_login"), True),
+            "user_data_dir": (g.get("user_data_dir") or None),
+            "profile_directory": (g.get("profile_directory") or None),
+            "driver_path": (g.get("driver_path") or None),
+            "email": (g.get("email") or ""),
+            "password": (g.get("password") or ""),
+            "title": (g.get("title") or None),
+        }
 
     def reset_workspace(hard: bool = False):
         # Stop flags
@@ -565,7 +642,13 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         return redirect(url_for('index'))
 
     # Helper to start the Download + Extract pipeline from code (route/scheduler)
-    def start_download_extract(url: str | None, fps_val: int, q_val: int, hw: bool) -> bool:
+    def start_download_extract(
+        url: str | None,
+        fps_val: int,
+        q_val: int,
+        hw: bool,
+        done_event: threading.Event | None = None,
+    ) -> bool:
         # Guard: do not start if any pipeline phase is running
         if state["download"]["running"] or state["processing"] or state["extract"]["running"]:
             with cond:
@@ -573,37 +656,49 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             return False
 
         def _job(url_val, fps_v, q_v, hw_v):
-            # Phase 1: Download
-            dl = Downloader(output_path=str(video_path))
-            used_url = url_val or dl.get_yn_url()
-            with cond:
-                state["source_url"] = used_url
-            def hook(info: dict):
-                with cond:
-                    state["download"]["progress"] = info
-                    cond.notify_all()
             try:
+                # Phase 1: Download
+                dl = Downloader(output_path=str(video_path))
+                used_url = url_val or dl.get_yn_url()
                 with cond:
-                    state["download"]["running"] = True
-                    state["download"]["last_log"] = "Starting download"
-                    state["download"]["progress"] = {"downloaded": 0, "total": 0, "speed": 0, "eta": 0, "status": "starting"}
-                    cond.notify_all()
-                dl.download_video(url=url_val, progress=hook)
-                with cond:
-                    p = state["download"]["progress"]
-                    p["status"] = "finished"
-                    state["download"]["progress"] = p
-                    state["download"]["last_log"] = "Download completed"
-            except Exception as e:
-                with cond:
-                    state["download"]["last_log"] = f"Download error: {e}"
-            finally:
-                with cond:
-                    state["download"]["running"] = False
-                    cond.notify_all()
+                    state["source_url"] = used_url
 
-            # Phase 2: Extract
-            _extract_job(fps_v, q_v, hw_v)
+                def hook(info: dict):
+                    with cond:
+                        state["download"]["progress"] = info
+                        cond.notify_all()
+
+                try:
+                    with cond:
+                        state["download"]["running"] = True
+                        state["download"]["last_log"] = "Starting download"
+                        state["download"]["progress"] = {
+                            "downloaded": 0,
+                            "total": 0,
+                            "speed": 0,
+                            "eta": 0,
+                            "status": "starting",
+                        }
+                        cond.notify_all()
+                    dl.download_video(url=url_val, progress=hook)
+                    with cond:
+                        p = state["download"]["progress"]
+                        p["status"] = "finished"
+                        state["download"]["progress"] = p
+                        state["download"]["last_log"] = "Download completed"
+                except Exception as e:
+                    with cond:
+                        state["download"]["last_log"] = f"Download error: {e}"
+                finally:
+                    with cond:
+                        state["download"]["running"] = False
+                        cond.notify_all()
+
+                # Phase 2: Extract
+                _extract_job(fps_v, q_v, hw_v)
+            finally:
+                if done_event is not None:
+                    done_event.set()
 
         threading.Thread(target=_job, args=(url, fps_val, q_val, hw), daemon=True).start()
         return True
@@ -1576,7 +1671,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 pass
         return removed
 
-    def _process_job(fresh: bool = False, fps_val: int = fps, q_val: int = 5, hwaccel: bool = False):
+    def _process_job(fresh: bool = False, fps_val: int = fps, q_val: int = 5, hwaccel: bool = False, debug_review: bool = False):
         try:
             state["processing"] = True
             # reset progress
@@ -1650,13 +1745,14 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 auto_detection_range=0.5,
                 fresh=fresh,
                 fps=fps_val,
-                prompt_handler=prompter,
+                prompt_handler=(prompter if debug_review else None),
                 progress_callback=progress,
                 ffmpeg_q=q_val,
                 ffmpeg_hwaccel=hwaccel,
                 ffmpeg_threads=0,
                 stop_fn=lambda: bool(state.get("stop")),
             )
+            proc.IS_DEBUG = bool(debug_review)
             # Apply saved bounds
             proc.height_upper = int(state["bounds"]["upper"])
             proc.height_lower = int(state["bounds"]["lower"])
@@ -1701,10 +1797,14 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             except Exception:
                 q_val = 5
             hwaccel = request.form.get('hw') == '1'
+            with cond:
+                state["process_debug"] = (request.form.get('debug') == '1')
+                _save_state_subset()
 
         should_start = (request.method == 'POST' and request.form.get('start') == '1')
+        debug_mode = bool(state.get("process_debug", False))
         if should_start and not state["processing"] and not state["download"]["running"] and not state["extract"]["running"] and not state["smart_thumbs"]["running"]:
-            t = threading.Thread(target=_process_job, args=(fresh, fps_val, q_val, hwaccel), daemon=True)
+            t = threading.Thread(target=_process_job, args=(fresh, fps_val, q_val, hwaccel, debug_mode), daemon=True)
             t.start()
         msg = "Running..." if state["processing"] else state["last_log"]
         # Initialize progress UI based on current state to avoid flashing 0%
@@ -1727,7 +1827,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         </div>
         <div class='nav mt-1'>
           {(f"<a class='btn secondary' href='{url_for('results')}'>Open Results</a>") if has_results else ""}
-          {(f"<form method='post' action='{url_for('process_stop')}' class='js-post' data-redirect='{url_for('process_run')}'><button type='submit' class='btn warn' style='margin-left:8px;'>Stop</button></form>") if state.get('processing') else (f"<form method='post' action='{url_for('process_run')}' class='js-post' data-redirect='{url_for('process_run')}'><input type='hidden' name='start' value='1'/><button type='submit' class='btn' style='margin-left:8px;'>Run</button></form>")}
+          {(f"<form method='post' action='{url_for('process_stop')}' class='js-post' data-redirect='{url_for('process_run')}'><button type='submit' class='btn warn' style='margin-left:8px;'>Stop</button></form>") if state.get('processing') else (f"<form method='post' action='{url_for('process_run')}' class='js-post' data-redirect='{url_for('process_run')}'><input type='hidden' name='start' value='1'/><button type='submit' class='btn' style='margin-left:8px;'>Run</button><label style='margin-left:8px; font-size:13px;'><input type='checkbox' name='debug' value='1' {'checked' if state.get('process_debug') else ''}/> Debug Review</label></form>")}
           <form method='post' action='{url_for('results_clear')}' class='js-post' data-redirect='{url_for('process_run')}' data-confirm='오늘자 결과 이미지를 모두 삭제할까요?' style='margin-left:8px;'>
             <button type='submit' class='btn warn' {disable_clear}>Clear Today Outputs</button>
           </form>
@@ -1770,29 +1870,63 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 cond.notify_all()
         return redirect(url_for('process_run'))
 
-    @app.get("/upload")
-    def upload_run():
-        # Read config
-        import configparser
-        cfg = configparser.ConfigParser()
-        cfg.read('config.ini')
-        creds = cfg['Credentials']
-        uploader = ImageUploader(
-            image_dir=str(base_path),
-            url=creds['url'],
-            id=creds['id'],
-            password=creds['password'],
-            no_gui=no_gui,
-            driver_path=creds.get('driver_path', 'chromedriver'),
-            user_data_dir=creds.get('user_data_dir'),
-            profile_directory=creds.get('profile_directory', 'Default'),
-        )
+    def _run_upload_job(allow_manual_login: bool = True):
+        with cond:
+            state["upload"]["running"] = True
+            state["upload"]["last_log"] = "Starting upload..."
+            state["last_log"] = "Starting upload..."
+            cond.notify_all()
         try:
-            uploader.upload_images()
-            msg = "Upload requested."
+            s = _load_upload_settings()
+            if not allow_manual_login and s["manual_login"]:
+                raise ValueError("Daily auto upload requires manual_login=false in user_config.ini")
+            upload_to_kakao(
+                url=s["url"],
+                email=s["email"],
+                password=s["password"],
+                image_dir=str(base_path),
+                headless=bool(s["headless"]),
+                user_data_dir=s["user_data_dir"],
+                profile_directory=s["profile_directory"],
+                driver_path=s["driver_path"],
+                title=s["title"],
+                manual_login=bool(s["manual_login"]),
+            )
+            with cond:
+                state["upload"]["last_log"] = "Upload done."
+                state["last_log"] = "Upload done."
+                cond.notify_all()
         except Exception as e:
-            msg = f"Upload failed: {e}"
-        return page(f"<p>{msg}</p>")
+            with cond:
+                state["upload"]["last_log"] = f"Upload failed: {e}"
+                state["last_log"] = f"Upload failed: {e}"
+                cond.notify_all()
+        finally:
+            with cond:
+                state["upload"]["running"] = False
+                cond.notify_all()
+
+    @app.post("/upload")
+    def upload_run():
+        ensure_today_base()
+        if state["upload"]["running"]:
+            with cond:
+                state["last_log"] = "Upload already running."
+                cond.notify_all()
+            return redirect(url_for("results"))
+        if state["download"]["running"] or state["extract"]["running"] or state["processing"] or state["smart_thumbs"]["running"]:
+            with cond:
+                state["last_log"] = "Busy: stop running jobs before upload."
+                cond.notify_all()
+            return redirect(url_for("results"))
+        if not _result_files():
+            with cond:
+                state["last_log"] = "No results to upload."
+                cond.notify_all()
+            return redirect(url_for("results"))
+
+        threading.Thread(target=_run_upload_job, daemon=True).start()
+        return redirect(url_for("results"))
 
     @app.get("/status")
     def status():
@@ -1892,6 +2026,9 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         files = _result_files()
         if not files:
             return page("<p>No results yet. Run processing first.</p>")
+        uploading = state["upload"]["running"]
+        upload_btn_label = "Uploading..." if uploading else "Upload"
+        upload_disable = "disabled" if uploading else ""
         items = []
         names_js = []
         for p in files:
@@ -1908,6 +2045,9 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         grid = "".join(items)
         body = f"""
         <div class='mt-2'>
+          <form method='post' action='{url_for('upload_run')}' class='js-post' data-redirect='{url_for('results')}' style='display:inline-block;'>
+            <button id='uploadBtn' type='submit' class='btn' {upload_disable}>{upload_btn_label}</button>
+          </form>
           <a class='btn' href='{url_for('results_download')}'>Download All</a>
           <a class='btn secondary' href='#' onclick='downloadResultsSeq();return false;' style='margin-left:6px;'>Download Each</a>
           <a class='btn secondary' href='{url_for('results_viewer')}' style='margin-left:6px;'>iOS Viewer</a>
@@ -1921,6 +2061,21 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         </div>
         <script>
           const RESULT_FILES = {names_js};
+          function syncUploadBtn(running) {{
+            const btn = document.getElementById('uploadBtn');
+            if (!btn) return;
+            btn.textContent = running ? 'Uploading...' : 'Upload';
+            btn.disabled = !!running;
+          }}
+          try {{
+            const es = new EventSource('{url_for('events')}');
+            es.onmessage = (ev) => {{
+              try {{
+                const s = JSON.parse(ev.data || '{{}}');
+                syncUploadBtn(!!(s.upload && s.upload.running));
+              }} catch {{}}
+            }};
+          }} catch {{}}
           function getDownloadDelay() {{
             const el = document.getElementById('dlDelay');
             let v = parseInt((el && el.value) || '1200', 10);

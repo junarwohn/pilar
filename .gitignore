@@ -10,6 +10,7 @@ out/
 pilar-venv/
 
 chrome_temp/
+/user_config.ini
 
 # Python
 __pycache__/

@@ -780,8 +780,8 @@ class ImageProcessor:
                     # Log metrics (ambiguous observation)
                     prev_word = self.pre_word[0] if self.pre_word else ""
                     self._log_metrics(file_name=file_name, decision="AMBIG", img_sim=img_sim, text_sim=str_diff, prev_word=prev_word, cur_word=cur_word)
-                    # In headless + prompt_handler mode, only enqueue after hysteresis threshold
-                    if callable(self.prompt_handler) and self.NO_GUI:
+                    # Only debug mode can ask for manual review. In production, treat ambiguous as DIFF.
+                    if self.IS_DEBUG and callable(self.prompt_handler) and self.NO_GUI:
                         amb = self._ambiguous_state
                         if amb.get("word") == cur_word:
                             amb["count"] = amb.get("count", 0) + 1
@@ -796,8 +796,7 @@ class ImageProcessor:
                         decision = self.DIFF
                         from_ambig = True
                     else:
-                        # GUI path: handled via prompt in handle_differences
-                        pass
+                        decision = self.DIFF
 
                 if decision == self.DIFF:
                     if self.IS_DEBUG:
@@ -946,14 +945,15 @@ class ImageProcessor:
                 return self.SAME if is_same_cached else self.DIFF
 
         # Hysteresis for ambiguous cases
-        # Consider OCR score: if very low, be conservative (treat as SAME)
+        # Consider OCR score: low confidence becomes AMBIG only in debug review mode.
         if ocr_score < 0.5:
-            # Low confidence -> mark ambiguous
-            self._ambiguous_state = {"word": cur_word, "count": 0}
-            return self.AMBIG
+            if self.IS_DEBUG and callable(self.prompt_handler):
+                self._ambiguous_state = {"word": cur_word, "count": 0}
+                return self.AMBIG
+            return self.DIFF
 
-        # Prefer prompt_handler immediately in GUI/interactive paths
-        if callable(self.prompt_handler):
+        # Ask only in debug mode when prompt_handler is explicitly provided.
+        if self.IS_DEBUG and callable(self.prompt_handler):
             overlay = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
             prev_word = (self.pre_word[0] if self.pre_word else "")
             ctx = {
@@ -982,24 +982,7 @@ class ImageProcessor:
                 return self.SAME
             return self.DIFF
 
-        # NO_GUI 모드에서는 바로 False 반환
-        if self.NO_GUI:
-            # Caller applies hysteresis and queuing; mark ambiguous here
-            return self.AMBIG
-        # GUI 모드: OpenCV 창으로 확인
-        cv2.imshow("dst", processed_img)
-        cv2.imshow("cur_bin", cur_bin)
-        add_img = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
-        cv2.imshow("Okay to enter", add_img)
-        ok = cv2.waitKey(0)
-        cv2.destroyAllWindows()
-        if ok != 13:
-            # self.pre_word = [cur_word]
-            baseline = self.pre_word[0] if self.pre_word else cur_word
-            self.pre_word = ([baseline] + self.pre_word)[:3]
-            if self.IS_DEBUG:
-                print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
-            return self.SAME
+        # Production default: ambiguous zone is treated as DIFF to avoid user intervention.
         return self.DIFF
 
     def handle_multiline(self, original_img, cur_img, cur_word, result_img):

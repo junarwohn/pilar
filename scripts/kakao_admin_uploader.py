@@ -20,6 +20,14 @@ except Exception:
     _HAS_WDM = False
 
 
+_KOREAN_WEEKDAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+
+
+def default_daily_title(now: datetime | None = None) -> str:
+    cur = now or datetime.now()
+    return f"{cur.strftime('%Y-%m-%d')}-{_KOREAN_WEEKDAYS[cur.weekday()]}"
+
+
 def _build_driver(headless: bool = False, user_data_dir: str | None = None, profile_directory: str | None = None, driver_path: str | None = None) -> webdriver.Chrome:
     opts = Options()
 
@@ -163,6 +171,72 @@ def _attach_images(wait: WebDriverWait, image_dir: str) -> int:
     return len(files)
 
 
+def _already_uploaded_today(drv: webdriver.Chrome, today_title: str) -> bool:
+    """Return True if card list already contains today's title."""
+    container_xpath = "//*[@id='mArticle']/div/div/div[2]/div/div"
+    try:
+        WebDriverWait(drv, 10).until(
+            EC.presence_of_element_located((By.XPATH, container_xpath))
+        )
+    except Exception:
+        # If list area is not present (e.g. directly on editor), do not block upload.
+        return False
+
+    # Primary selector from provided structure
+    title_xpath = f"{container_xpath}/div/div[2]/div[2]/div[1]/strong"
+    try:
+        titles = drv.find_elements(By.XPATH, title_xpath)
+        for el in titles:
+            txt = (el.text or "").strip()
+            if txt == today_title:
+                return True
+    except Exception:
+        pass
+
+    # Fallback selector by classes under card_list/box_card
+    try:
+        cards = drv.find_elements(By.CSS_SELECTOR, "div.card_list div.box_card")
+        for card in cards:
+            try:
+                strong = card.find_element(By.CSS_SELECTOR, "strong")
+                txt = (strong.text or "").strip()
+                if txt == today_title:
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return False
+
+
+def _wait_submit_enabled(drv: webdriver.Chrome, timeout: int = 180):
+    """Wait until submit button becomes enabled after image upload."""
+    selectors = [
+        "button.btn_g.btn_g2[type='submit']",
+        "button[type='submit']",
+        "button[aria-label*='등록'], button[aria-label*='저장']",
+    ]
+
+    end = time.time() + max(1, timeout)
+    last_btn = None
+    while time.time() < end:
+        for sel in selectors:
+            try:
+                btn = drv.find_element(By.CSS_SELECTOR, sel)
+                last_btn = btn
+                disabled_attr = btn.get_attribute("disabled")
+                class_name = (btn.get_attribute("class") or "").lower()
+                is_disabled = (disabled_attr is not None) or ("disabled" in class_name)
+                if btn.is_enabled() and not is_disabled:
+                    return btn
+            except Exception:
+                continue
+        time.sleep(0.5)
+
+    raise TimeoutError("Submit button did not become enabled within timeout") from None
+
+
 def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headless: bool = False, user_data_dir: str | None = None, profile_directory: str | None = None, driver_path: str | None = None, title: str | None = None, manual_login: bool = False) -> None:
     drv = _build_driver(
         headless=headless,
@@ -174,6 +248,11 @@ def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headles
 
     try:
         drv.get(url)
+
+        today_title = default_daily_title()
+        if _already_uploaded_today(drv, today_title):
+            print(f"Skip upload: today's post already exists ({today_title}).")
+            return
 
         # If we land on Kakao login
         if manual_login:
@@ -203,7 +282,7 @@ def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headles
             pass
 
         # Title input
-        ttl = title or datetime.now().strftime("%Y-%m-%d")
+        ttl = title or today_title
         title_input = _wait_visible(
             wait,
             [
@@ -221,31 +300,13 @@ def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headles
         # Attach images
         count = _attach_images(wait, image_dir)
 
-        # Submit/publish
-        submit_btn = _wait_visible(
-            wait,
-            [
-                (By.CSS_SELECTOR, "button.btn_g.btn_g2[type='submit']"),
-                (By.CSS_SELECTOR, "button[type='submit']"),
-                (By.CSS_SELECTOR, "button[aria-label*='등록'], button[aria-label*='저장']"),
-            ],
-        )
-
-        # Some UIs set disabled attribute until form is valid
-        try:
-            if submit_btn.get_attribute("disabled"):
-                drv.execute_script("arguments[0].removeAttribute('disabled');", submit_btn)
-        except Exception:
-            pass
-
+        # Give UI a short settle time, then wait until submit button is truly enabled.
+        time.sleep(5)
+        submit_btn = _wait_submit_enabled(drv, timeout=180)
         submit_btn.click()
 
-        # Wait for navigation or success toast
-        time.sleep(2)
-        try:
-            WebDriverWait(drv, 30).until(lambda d: d.current_url != url)
-        except Exception:
-            pass
+        # User requested immediate close behavior after click.
+        time.sleep(3)
 
         print(f"Uploaded {count} images with title '{ttl}'.")
     finally:
@@ -262,7 +323,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--email", help="Kakao Account email (login). Omit with --manual-login")
     p.add_argument("--password", help="Kakao Account password. Omit with --manual-login")
     p.add_argument("--image-dir", required=True, help="Directory containing YYMMDD_XX.jpg files")
-    p.add_argument("--title", default=None, help="Optional post title (default: YYYY-MM-DD)")
+    p.add_argument("--title", default=None, help="Optional post title (default: YYYY-MM-DD-요일)")
 
     # Browser options
     p.add_argument("--headless", action="store_true", help="Run Chrome in headless mode")

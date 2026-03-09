@@ -88,8 +88,10 @@ class ImageUploader:
         login_button.click()
         
     def upload_images(self):
-        # get current YYYY-MM-DD
-        current_date = datetime.now().strftime("%Y-%m-%d")
+        # get current YYYY-MM-DD-<Korean weekday>
+        now = datetime.now()
+        weekday_kor = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"][now.weekday()]
+        current_date = f"{now.strftime('%Y-%m-%d')}-{weekday_kor}"
         # Read config file
         url = self.url
         driver = self.setup_driver()

@@ -1,10 +1,9 @@
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
-from datetime import datetime
 import os
 
-from scripts.kakao_admin_uploader import upload_to_kakao
+from scripts.kakao_admin_uploader import default_daily_title, upload_to_kakao
 
 
 def run_upload(url, image_dir, title, headless, user_data_dir, profile_directory, driver_path, manual_login):
@@ -48,7 +47,7 @@ def main():
 
     # Title
     tk.Label(root, text="제목").grid(row=2, column=0, sticky="e", padx=6, pady=6)
-    title_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+    title_var = tk.StringVar(value=default_daily_title())
     tk.Entry(root, textvariable=title_var, width=60).grid(row=2, column=1, columnspan=2, sticky="we", padx=6)
 
     # Options
@@ -123,4 +122,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

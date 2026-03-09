@@ -2,19 +2,53 @@ import time
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
-import yt_dlp as yt
 import os
 import shutil
 import subprocess
 import logging
+import importlib
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_false_env(v):
+    if not v:
+        return False
+    return v.strip().lower() in {"0", "false", "off", "no"}
 
 class Downloader:
     def __init__(self, output_path):
         self.output_path = output_path
         self.url = None
+
+    def _upgrade_yt_dlp(self):
+        if _is_false_env(os.getenv("PILAR_YTDLP_AUTO_UPGRADE")):
+            logger.info("Skipping yt-dlp pre-upgrade (PILAR_YTDLP_AUTO_UPGRADE disabled)")
+            return
+        cmd = os.getenv("PILAR_YTDLP_UPGRADE_CMD", "uv pip install -U yt-dlp")
+        logger.info("Running yt-dlp pre-upgrade: %s", cmd)
+        try:
+            proc = subprocess.run(
+                cmd,
+                shell=True,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if proc.returncode != 0:
+                msg = (proc.stderr or proc.stdout or "").strip()
+                logger.warning(
+                    "yt-dlp pre-upgrade failed (code=%s), continue with current version: %s",
+                    proc.returncode,
+                    msg,
+                )
+                return
+            out = (proc.stdout or "").strip()
+            if out:
+                logger.info("yt-dlp pre-upgrade output: %s", out)
+        except Exception as e:
+            logger.warning("yt-dlp pre-upgrade error, continue with current version: %s", e)
 
     def download_video(self, url=None, progress=None):
         if url is None:
@@ -29,6 +63,11 @@ class Downloader:
         now = time.localtime()
         now_formatted = time.strftime('%Y%m%d-%H%M%S', now)
         ret = False
+
+        # Refresh package before each download and reload module in this process.
+        self._upgrade_yt_dlp()
+        yt = importlib.import_module("yt_dlp")
+        yt = importlib.reload(yt)
 
         def _hook(d):
             if progress is None:
