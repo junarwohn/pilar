@@ -5,6 +5,7 @@ set -euo pipefail
 # Usage: ./run-web.sh [PORT]
 
 PORT="${1:-8000}"
+THREADS="${PILAR_WEB_THREADS:-4}"
 
 # Activate local venv if present
 if [ -f "./pilar-venv/bin/activate" ]; then
@@ -18,4 +19,4 @@ echo "Starting Web UI on ${URL}"
 # Note: Do not auto-open a browser
 
 # Use a single worker because in-memory state is not shared across workers.
-gunicorn -w 1 -k gthread --threads 8 --timeout 0 --bind 0.0.0.0:8000 pilar.web.wsgi:app
+gunicorn -w 1 -k gthread --threads "$THREADS" --timeout 0 --bind "0.0.0.0:${PORT}" pilar.web.wsgi:app

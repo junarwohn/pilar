@@ -8,7 +8,6 @@ import re
 import numpy as np
 from rapidfuzz.distance import Levenshtein
 import csv
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 import time
 import os
@@ -37,7 +36,7 @@ else:
 TESSDATA_PATH=r"./res/"  # Kept for compatibility; no longer used by PaddleOCR
 
 class ImageProcessor:
-    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2, fresh=True, fps: int = 2, prompt_handler=None, progress_callback=None, ffmpeg_q: int = 5, ffmpeg_hwaccel: bool = False, ffmpeg_threads: int = 0, stop_fn=None):
+    def __init__(self, video_path, extract_dir, thumbs_dir, no_gui=False, zoom=100, auto_detection_range=1/2, fresh=True, fps: int = 3, prompt_handler=None, progress_callback=None, ffmpeg_q: int = 5, ffmpeg_hwaccel: bool = False, ffmpeg_threads: int = 0, stop_fn=None):
         self.video_path = video_path
         self.extract_dir = extract_dir
         self.thumbs_dir = thumbs_dir
@@ -78,6 +77,8 @@ class ImageProcessor:
         self._ocr_empty_cache = {}
         # Ambiguity hysteresis state
         self._ambiguous_state = {"word": None, "count": 0}
+        self.ocr_call_count = 0
+        self.fast_skip_count = 0
         # Tri-state decision codes
         self.DIFF = -1
         self.AMBIG = 0
@@ -85,25 +86,37 @@ class ImageProcessor:
 
         # Initialize PaddleOCR (CPU-only) for Korean text (optionally mixed with English)
         try:
-            # On Intel N100, using mkldnn and a small thread count helps
-            # Disable angle classifier for horizontal subtitles to speed up
-            self.engine = OCREngine(lang="korean", enable_angle_cls=False, cpu_threads=4, use_mkldnn=True)
+            machine = platform.machine().lower()
+            default_threads = 2 if machine.startswith(("arm", "aarch64")) else min(4, os.cpu_count() or 2)
+            try:
+                ocr_threads = max(1, int(os.getenv("PILAR_OCR_THREADS", str(default_threads))))
+            except ValueError:
+                ocr_threads = default_threads
+            self.ocr_threads = ocr_threads
+            self.engine = OCREngine(
+                lang="korean",
+                enable_angle_cls=False,
+                cpu_threads=ocr_threads,
+                use_mkldnn=not machine.startswith(("arm", "aarch64")),
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OCR engine: {e}")
 
         # Optional FaceMesh for smart header picking (best-effort)
         self._face_mesh = None
-        try:
-            import mediapipe as mp  # type: ignore
-            self._mp = mp
-            self._face_mesh = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True,
-                refine_landmarks=False,
-                max_num_faces=2,
-                min_detection_confidence=0.5,
-            )
-        except Exception:
-            self._mp = None
+        self._mp = None
+        if not self.NO_GUI:
+            try:
+                import mediapipe as mp  # type: ignore
+                self._mp = mp
+                self._face_mesh = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=True,
+                    refine_landmarks=False,
+                    max_num_faces=2,
+                    min_detection_confidence=0.5,
+                )
+            except Exception:
+                pass
 
         # Clean and create directories (only when fresh)
         if fresh:
@@ -472,11 +485,33 @@ class ImageProcessor:
                 cv2.destroyAllWindows()
 
     def process_image(self, img):
+        return self._prepare_ocr_image(img), self._binarize_image(img)
+
+    @staticmethod
+    def _binarize_image(img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         inverted = cv2.bitwise_not(gray)
-        bilateral_filter = cv2.bilateralFilter(inverted, 9, 16, 16)
         _, binary = cv2.threshold(inverted, 127, 255, cv2.THRESH_BINARY)
-        return bilateral_filter, binary
+        return binary
+
+    @staticmethod
+    def _prepare_ocr_image(img):
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        inverted = cv2.bitwise_not(gray)
+        return cv2.bilateralFilter(inverted, 9, 16, 16)
+
+    @classmethod
+    def _comparison_image(cls, img, max_width: int = 320):
+        """Build a small binary subtitle image for the cheap change gate."""
+        h, w = img.shape[:2]
+        if w > max_width:
+            scale = max_width / float(w)
+            img = cv2.resize(
+                img,
+                (max_width, max(1, int(h * scale))),
+                interpolation=cv2.INTER_AREA,
+            )
+        return cls._binarize_image(img)
 
     def _normalize_text(self, s: str) -> str:
         s = unicodedata.normalize("NFKC", s or "")
@@ -537,6 +572,7 @@ class ImageProcessor:
 
     def extract_text(self, img):
         start = time.time()
+        self.ocr_call_count += 1
         try:
             # Downscale for speed (user scale first, then max width cap)
             h, w = img.shape[:2]
@@ -574,40 +610,20 @@ class ImageProcessor:
         # Guard: ensure frames exist
         if not self.file_list:
             raise RuntimeError("No extracted frames found. Run extraction first.")
-        result_img = self.get_new_result_img(center_idx=0)
+        processing_started = time.monotonic()
+        result_img = None if self.NO_GUI else self.get_new_result_img(center_idx=0)
         original_img = cv2.imread(f"{self.extract_dir}/" + self.file_list[0])
         pre_img = original_img[self.height_upper:self.height_lower, :]
         # pre_img = cv2.resize(pre_img, dsize=(int(original_img.shape[1] * pre_img.shape[0] /  original_img.shape[0]), original_img.shape[0]))
         pre_img = pre_img[:, int(pre_img.shape[1] * (self.zoom - 100) / 100 / 2) : int(pre_img.shape[1] * (1 - (self.zoom - 100) / 100 / 2))]
         pre_img = cv2.resize(pre_img, dsize=(original_img.shape[1], int(original_img.shape[1] * pre_img.shape[0] /  original_img.shape[0])))
-        pre_processed, pre_bin = self.process_image(pre_img)
+        pre_bin_cmp = self._comparison_image(pre_img)
 
         total = len(self.file_list)
         idx = 0
         iterable = self.file_list
         if not self.IS_DEBUG:
             iterable = tqdm(iterable)
-
-        # Scale for image-similarity comparison (match OCR scale from web UI)
-        def _scale_for_compare(img: np.ndarray) -> np.ndarray:
-            try:
-                scale = float(getattr(self, "ocr_scale", 1.0) or 1.0)
-            except Exception:
-                scale = 1.0
-            if scale <= 0:
-                scale = 1.0
-            if scale == 1.0:
-                return img
-            h, w = img.shape[:2]
-            nw = max(1, int(w * scale))
-            nh = max(1, int(h * scale))
-            if nw == w and nh == h:
-                return img
-            # Use AREA for downscale, LINEAR for upscale
-            interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
-            return cv2.resize(img, (nw, nh), interpolation=interp)
-
-        pre_bin_cmp = _scale_for_compare(pre_bin)
 
         # Page assembly buffers (used in web/headless path with deferred review)
         page_segments = []           # list of subtitle crop images for current page
@@ -667,9 +683,7 @@ class ImageProcessor:
                 self._used_header_idxs.append(self._last_header_idx)
                 if len(self._used_header_idxs) > 64:
                     self._used_header_idxs = self._used_header_idxs[-64:]
-            composed = header
-            for seg in page_segments:
-                composed = np.vstack((composed, seg))
+            composed = np.vstack([header, *page_segments])
             # Save page
             # Write accepted words for this page into out/date/words.txt (append)
             try:
@@ -688,8 +702,9 @@ class ImageProcessor:
             page_words = []
             page_pending_indices = set()
             page_header_img = None
-            # Reset result image base for next page (GUI path usage)
-            result_img = self.get_new_result_img(center_idx=self._idx)
+            # Reset result image base only for the interactive OpenCV path.
+            if not self.NO_GUI:
+                result_img = self.get_new_result_img(center_idx=self._idx)
 
         for file_name in iterable:
             # Allow external stop request
@@ -712,15 +727,14 @@ class ImageProcessor:
             # cur_img = cv2.resize(cur_img, None, fx=original_img.shape[1] / cur_img.shape[1], fy=original_img.shape[1] / cur_img.shape[1])
             # cur_img = cv2.resize(cur_img, dsize=(int(original_img.shape[1] * cur_img.shape[0] /  original_img.shape[0]), original_img.shape[0]))
             cur_img = cv2.resize(cur_img, dsize=(original_img.shape[1], int(original_img.shape[1] * cur_img.shape[0] /  original_img.shape[0])))
-            processed_img, cur_bin = self.process_image(cur_img)
-            cur_bin_cmp = _scale_for_compare(cur_bin)
+            cur_bin_cmp = self._comparison_image(cur_img)
             # Early skip: if images are near-identical, skip OCR entirely
             img_sim_early = self.img_similarity(pre_bin_cmp, cur_bin_cmp)
             if img_sim_early >= getattr(self, "sim_skip_threshold", 0.985):
                 # Advance baseline and continue
                 pre_img = cur_img
-                pre_bin = cur_bin
                 pre_bin_cmp = cur_bin_cmp
+                self.fast_skip_count += 1
                 if self.IS_DEBUG:
                     print(f"Skip OCR (img_sim={img_sim_early:.3f} >= {self.sim_skip_threshold})")
                 # Log early skip (no OCR)
@@ -728,20 +742,25 @@ class ImageProcessor:
                 self._log_metrics(file_name=file_name, decision="EARLY_SKIP", img_sim=img_sim_early, text_sim=None, prev_word=prev_word, cur_word="")
                 continue
 
-            # Cache lookup by content hash to avoid repeated OCR on same binarized content
+            # Full-resolution thresholding is cheap and keeps the OCR cache exact.
+            cur_bin = self._binarize_image(cur_img)
             hkey = hashlib.sha1(cur_bin.tobytes()).hexdigest()
             cur_word = self._ocr_cache.get(hkey)
+            processed_img = None
             if cur_word is None:
                 empty_last_idx = self._ocr_empty_cache.get(hkey, -10_000_000)
                 if (self._idx - empty_last_idx) <= getattr(self, "ocr_empty_ttl_frames", 30):
                     cur_word = ""
                 else:
+                    processed_img = self._prepare_ocr_image(cur_img)
                     cur_word = self.extract_text(processed_img)
                     if cur_word:
                         self._ocr_cache[hkey] = cur_word
                         self._ocr_empty_cache.pop(hkey, None)
                     else:
                         self._ocr_empty_cache[hkey] = self._idx
+            if self.IS_DEBUG and processed_img is None:
+                processed_img = self._prepare_ocr_image(cur_img)
             if len(cur_word) < 3:
                 continue
 
@@ -761,7 +780,6 @@ class ImageProcessor:
                     baseline = self.pre_word[0] if self.pre_word else cur_word
                     self.pre_word = ([baseline] + self.pre_word)[:3]
                     pre_img = cur_img
-                    pre_bin = cur_bin
                     pre_bin_cmp = cur_bin_cmp
                     if self.IS_DEBUG:
                         print(f"\nSAME, str_diff : {str_diff:.03f}, img_sim : {img_sim:.03f}, pre : [{self.pre_word}], cur : [{cur_word}]")
@@ -805,8 +823,9 @@ class ImageProcessor:
                     dec_label = "MANUAL_DIFF" if getattr(self, "_last_manual", False) else "DIFF"
                     prev_word = self.pre_word[0] if self.pre_word else ""
                     self._log_metrics(file_name=file_name, decision=dec_label, img_sim=img_sim, text_sim=str_diff, prev_word=prev_word, cur_word=cur_word)
-                    if callable(self.prompt_handler) and self.NO_GUI:
-                        # Add segment to current page buffer; ambiguous ones reached threshold already
+                    if self.NO_GUI:
+                        # Buffer headless output and concatenate once per page. Repeated
+                        # vstack calls copy the growing image on every subtitle.
                         page_index = len(page_segments)
                         # On first segment of a new page, use the same frame as the first subtitle
                         if page_index == 0 or page_header_img is None:
@@ -816,24 +835,25 @@ class ImageProcessor:
                                 page_header_img = None
                         page_segments.append(cur_img)
                         page_words.append(cur_word)
-                        overlay = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
-                        prev_word = (self.pre_word[0] if self.pre_word else "")
-                        ctx = {
-                            "processed_img": processed_img,
-                            "cur_bin": cur_bin,
-                            "pre_img": pre_img,
-                            "cur_img": cur_img,
-                            "overlay": overlay,
-                            "str_diff": float(str_diff),
-                            "img_sim": float(img_sim),
-                            "cur_word": cur_word,
-                            "prev_word": prev_word,
-                            "text_sim": float(str_diff),
-                            "page_index": page_index,
-                        }
-                        self._pending_ctxs.append(ctx)
-                        if from_ambig:
-                            page_pending_indices.add(page_index)
+                        if callable(self.prompt_handler):
+                            overlay = cv2.addWeighted(pre_img, 0.5, cur_img, 0.5, 0)
+                            prev_word = (self.pre_word[0] if self.pre_word else "")
+                            ctx = {
+                                "processed_img": processed_img,
+                                "cur_bin": cur_bin,
+                                "pre_img": pre_img,
+                                "cur_img": cur_img,
+                                "overlay": overlay,
+                                "str_diff": float(str_diff),
+                                "img_sim": float(img_sim),
+                                "cur_word": cur_word,
+                                "prev_word": prev_word,
+                                "text_sim": float(str_diff),
+                                "page_index": page_index,
+                            }
+                            self._pending_ctxs.append(ctx)
+                            if from_ambig:
+                                page_pending_indices.add(page_index)
                         # Update counters/progress
                         self.add_cnt += 1
                         if len(page_segments) >= 20:
@@ -861,16 +881,22 @@ class ImageProcessor:
             # New substring baseline (or same) — advance baseline images
             self.pre_word = [cur_word]
             pre_img = cur_img
-            pre_bin = cur_bin
             pre_bin_cmp = cur_bin_cmp
 
         # Flush remaining segments at the end
-        if callable(self.prompt_handler) and self.NO_GUI:
+        if self.NO_GUI:
             _finalize_and_save_page()
         else:
             if self.add_cnt % 20 != 0:
                 self.save_result(result_img)
         self._flush_metrics(force=True)
+        elapsed = max(0.001, time.monotonic() - processing_started)
+        print(
+            f"Processing stats: frames={idx}, fast_skips={self.fast_skip_count}, "
+            f"ocr_calls={self.ocr_call_count}, pages={self.page_cnt}, "
+            f"elapsed={elapsed:.1f}s, throughput={idx / elapsed:.2f}fps, "
+            f"ocr_threads={self.ocr_threads}"
+        )
 
     def handle_differences(self, processed_img, cur_bin, pre_img, cur_img, str_diff, img_sim, cur_word, ocr_score: float = 0.0):
         if self.IS_DEBUG and not self.NO_GUI:

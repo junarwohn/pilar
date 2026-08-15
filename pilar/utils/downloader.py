@@ -3,7 +3,6 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 import os
-import shutil
 import subprocess
 import logging
 import importlib
@@ -12,10 +11,8 @@ import importlib
 logger = logging.getLogger(__name__)
 
 
-def _is_false_env(v):
-    if not v:
-        return False
-    return v.strip().lower() in {"0", "false", "off", "no"}
+def _is_true_env(v):
+    return bool(v and v.strip().lower() in {"1", "true", "on", "yes"})
 
 class Downloader:
     def __init__(self, output_path):
@@ -23,8 +20,8 @@ class Downloader:
         self.url = None
 
     def _upgrade_yt_dlp(self):
-        if _is_false_env(os.getenv("PILAR_YTDLP_AUTO_UPGRADE")):
-            logger.info("Skipping yt-dlp pre-upgrade (PILAR_YTDLP_AUTO_UPGRADE disabled)")
+        if not _is_true_env(os.getenv("PILAR_YTDLP_AUTO_UPGRADE")):
+            logger.info("Skipping yt-dlp pre-upgrade (set PILAR_YTDLP_AUTO_UPGRADE=1 to enable)")
             return
         cmd = os.getenv("PILAR_YTDLP_UPGRADE_CMD", "uv pip install -U yt-dlp")
         logger.info("Running yt-dlp pre-upgrade: %s", cmd)
@@ -87,10 +84,10 @@ class Downloader:
             except Exception:
                 pass
 
-        # Prefer H.264 (AVC) video to avoid AV1 decode overhead/compat issues.
-        # Falls back to best MP4 if AVC selection isn't available.
+        # Preserve 1080p subtitle detail, but avoid decoding 60 fps on low-power
+        # devices when the processing pipeline samples only a few frames/second.
         ydl_opts = {
-            'format': "bv*[vcodec*=avc1][height<=1080][fps<=60]+ba[ext=m4a]/best[ext=mp4]",
+            'format': "bv*[vcodec*=avc1][height<=1080][fps<=30]+ba[ext=m4a]/best[ext=mp4][height<=1080]",
             'merge_output_format': 'mp4',
             'outtmpl': self.output_path,
             # Ensure we replace yesterday's file when a new day starts

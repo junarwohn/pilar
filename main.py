@@ -7,6 +7,8 @@ import logging
 import sys
 from pathlib import Path
 
+from scripts.output_cleanup import remove_old_output_dirs
+
 
 def run_web(no_gui: bool, host: str = "0.0.0.0", port: int = 8000):
     # Lazy import to avoid dependency unless used
@@ -22,6 +24,11 @@ def run_web(no_gui: bool, host: str = "0.0.0.0", port: int = 8000):
 
 
 if __name__ == "__main__":
+    repo_root = Path(__file__).resolve().parent
+    removed = remove_old_output_dirs(repo_root / "out")
+    if removed:
+        print(f"Removed {len(removed)} output directories older than one week.")
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--no-gui', action='store_true', help='Run without GUI')
     parser.add_argument('--web', action='store_true', help='Start web UI (Flask)')
@@ -37,7 +44,6 @@ if __name__ == "__main__":
 
     # Set up directories
     day_info = time.strftime('%Y-%m-%d', time.localtime())[2:]
-    repo_root = Path(__file__).resolve().parent
     base_dir_path = (repo_root / "out" / day_info).resolve()
     base_dir = str(base_dir_path)
     video_path = str(base_dir_path / "src.mp4")

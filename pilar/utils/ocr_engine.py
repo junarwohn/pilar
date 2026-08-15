@@ -52,6 +52,7 @@ class OCREngine:
             use_gpu=False,
             lang=lang,
             use_angle_cls=enable_angle_cls,
+            show_log=False,
         )
         opt_kwargs = {}
         if cpu_threads is not None:

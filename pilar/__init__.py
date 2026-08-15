@@ -1,3 +1,2 @@
-from . import utils
-
+"""Pilar package."""
 

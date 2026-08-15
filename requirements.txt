@@ -2,14 +2,12 @@
 beautifulsoup4==4.14.3
 Flask==3.1.2
 gunicorn==23.0.0
-matplotlib==3.10.8
 numpy==1.26.4
 opencv-python==4.6.0.66
 paddleocr==2.7.0.3
 paddlepaddle==2.6.2
 RapidFuzz==3.14.3
 requests==2.32.5
-scikit-learn==1.5.2
 selenium==4.28.1
 tqdm==4.67.1
 webdriver-manager==4.0.2

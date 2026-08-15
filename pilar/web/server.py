@@ -15,10 +15,10 @@ import json
 from pilar.utils.downloader import Downloader
 from pilar.utils.image_processor import ImageProcessor
 from pilar.utils.smart_thumbs import smart_auto_thumbs
-from scripts.kakao_admin_uploader import upload_to_kakao
+from scripts.output_cleanup import remove_old_output_dirs
 
 
-def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2, step_size: int = 150):
+def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 3, step_size: int = 150):
     app = Flask(__name__)
 
     # Paths
@@ -29,6 +29,9 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
     # Persisted settings live at parent (stable across day rollover)
     bounds_file = (base_path.parent / "bounds.json").resolve()
     state_file = (base_path.parent / "state.json").resolve()
+    removed_output_dirs = remove_old_output_dirs(base_path.parent)
+    if removed_output_dirs:
+        print(f"Removed {len(removed_output_dirs)} output directories older than one week.")
     base_path.mkdir(parents=True, exist_ok=True)
     extract_dir.mkdir(exist_ok=True)
     thumbs_dir.mkdir(exist_ok=True)
@@ -1028,37 +1031,65 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 except Exception:
                     pass
 
-            # Build ffmpeg command
-            cmd = [
-                'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
-                '-threads', '0'
-            ]
-            if hw:
-                cmd += ['-hwaccel', 'auto']
-            cmd += [
-                '-i', str(video_path),
-                '-map', '0:v:0', '-an', '-sn', '-dn',
-                '-vf', f'fps={fps_val}',
-                '-q:v', str(q_val),
-                str(extract_dir / 'img%04d.jpg')
-            ]
-            proc = subprocess.Popen(cmd)
+            def run_ffmpeg(use_hwaccel: bool):
+                cmd = [
+                    'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+                    '-progress', 'pipe:1', '-nostats', '-threads', '0',
+                ]
+                if use_hwaccel:
+                    cmd += ['-hwaccel', 'auto']
+                cmd += [
+                    '-i', str(video_path),
+                    '-map', '0:v:0', '-an', '-sn', '-dn',
+                    '-vf', f'fps={fps_val}',
+                    '-q:v', str(q_val),
+                    str(extract_dir / 'img%04d.jpg'),
+                ]
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                current = 0
+                messages = []
+                progress_keys = {
+                    'fps', 'stream_0_0_q', 'bitrate', 'total_size',
+                    'out_time_us', 'out_time_ms', 'out_time',
+                    'dup_frames', 'drop_frames', 'speed', 'progress',
+                }
+                if proc.stdout is not None:
+                    for line in proc.stdout:
+                        key, _, value = line.strip().partition('=')
+                        if key != 'frame':
+                            if key not in progress_keys and line.strip():
+                                messages.append(line.strip())
+                                messages = messages[-20:]
+                            continue
+                        try:
+                            current = int(value)
+                        except ValueError:
+                            continue
+                        with cond:
+                            total = state["extract"]["progress"].get("total", 0)
+                            state["extract"]["progress"] = {
+                                "current": current,
+                                "total": int(total),
+                                "fps": fps_val,
+                            }
+                            cond.notify_all()
+                return_code = proc.wait()
+                return return_code, current, "\n".join(messages)
 
-            # Poll progress by counting files
-            while True:
-                ret = proc.poll()
-                cur = len(list(extract_dir.glob('*.jpg')))
-                with cond:
-                    pr = state["extract"]["progress"]
-                    total = pr.get("total", 0)
-                    state["extract"]["progress"] = {"current": int(cur), "total": int(total), "fps": fps_val}
-                    cond.notify_all()
-                if ret is not None:
-                    break
-                time.sleep(0.5)
+            ret, cur, error = run_ffmpeg(hw)
+            if ret != 0 and hw:
+                for p in extract_dir.glob("*.jpg"):
+                    p.unlink(missing_ok=True)
+                ret, cur, error = run_ffmpeg(False)
+            if ret != 0:
+                raise RuntimeError(f"ffmpeg failed: {error or f'exit code {ret}'}")
 
-            # Final update
-            cur = len(list(extract_dir.glob('*.jpg')))
             with cond:
                 pr = state["extract"]["progress"]
                 total = pr.get("total", 0)
@@ -1871,6 +1902,8 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         return redirect(url_for('process_run'))
 
     def _run_upload_job(allow_manual_login: bool = True):
+        from scripts.kakao_admin_uploader import upload_to_kakao
+
         with cond:
             state["upload"]["running"] = True
             state["upload"]["last_log"] = "Starting upload..."

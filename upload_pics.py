@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from scripts.kakao_admin_uploader import upload_to_kakao
+from scripts.output_cleanup import remove_old_output_dirs
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -77,6 +78,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    removed = remove_old_output_dirs(ROOT_DIR / "out")
+    if removed:
+        print(f"Removed {len(removed)} output director{'y' if len(removed) == 1 else 'ies'} older than one week.")
+
     cfg_path = Path(args.config).expanduser().resolve()
     global_cfg = load_global_config(cfg_path)
 

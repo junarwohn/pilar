@@ -13,6 +13,11 @@
   - Windows: `run-web.bat [포트]` (기본 8000, 브라우저 자동 오픈 없음)
   - macOS/Linux: `./run-web.sh [포트]` (기본 8000, 브라우저 자동 오픈 없음)
 - 접속: 브라우저에서 `http://<서버IP>:8000`
+- 기본 프레임 추출: 3 FPS
+- RPi 조정 환경변수:
+  - `PILAR_OCR_THREADS`: PaddleOCR CPU 스레드 수(ARM 기본 2)
+  - `PILAR_WEB_THREADS`: Gunicorn 웹 스레드 수(기본 4)
+  - `PILAR_YTDLP_AUTO_UPGRADE=1`: 다운로드 전 yt-dlp 업데이트가 필요할 때만 사용
 - 기능:
   - Download: YouTube URL 입력 또는 자동 URL 탐지 후 다운로드
   - Extract: `ffmpeg`로 프레임 추출(FPS 지정)
