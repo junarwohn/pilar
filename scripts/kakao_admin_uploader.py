@@ -36,7 +36,9 @@ def _build_driver(headless: bool = False, user_data_dir: str | None = None, prof
         opts.add_argument(f"--user-data-dir={user_data_dir}")
     else:
         temp_profile = os.path.join(os.getcwd(), "chrome_temp")
+        temp_profile = "/tmp/chrome_test2"
         opts.add_argument(f"--user-data-dir={temp_profile}")
+        opts.add_argument("--password-store=basic")
 
     if profile_directory:
         opts.add_argument(f"--profile-directory={profile_directory}")
@@ -63,7 +65,9 @@ def _build_driver(headless: bool = False, user_data_dir: str | None = None, prof
             return drv
         except Exception:
             if _HAS_WDM:
-                service = Service(ChromeDriverManager().install())
+                #service = Service(ChromeDriverManager().install())
+                service = Service("/usr/bin/chromedriver")
+                driver = webdriver.Chrome(service=service, options=opts)
             else:
                 # Re-raise with a clearer message
                 raise RuntimeError(
@@ -244,10 +248,11 @@ def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headles
         profile_directory=profile_directory,
         driver_path=driver_path,
     )
-    wait = WebDriverWait(drv, 15)
+    wait = WebDriverWait(drv, 25)
 
     try:
         drv.get(url)
+        time.sleep(10)
 
         today_title = default_daily_title()
         if _already_uploaded_today(drv, today_title):
@@ -301,12 +306,12 @@ def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headles
         count = _attach_images(wait, image_dir)
 
         # Give UI a short settle time, then wait until submit button is truly enabled.
-        time.sleep(5)
+        time.sleep(20)
         submit_btn = _wait_submit_enabled(drv, timeout=180)
         submit_btn.click()
 
         # User requested immediate close behavior after click.
-        time.sleep(3)
+        time.sleep(20)
 
         print(f"Uploaded {count} images with title '{ttl}'.")
     finally:
