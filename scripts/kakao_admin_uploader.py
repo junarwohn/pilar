@@ -1,6 +1,7 @@
 import argparse
 import glob
 import os
+import shutil
 import sys
 import time
 from datetime import datetime
@@ -12,14 +13,6 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-try:
-    # Optional: falls back to local driver if available
-    from webdriver_manager.chrome import ChromeDriverManager  # type: ignore
-    _HAS_WDM = True
-except Exception:
-    _HAS_WDM = False
-
-
 _KOREAN_WEEKDAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
 
 
@@ -28,23 +21,32 @@ def default_daily_title(now: datetime | None = None) -> str:
     return f"{cur.strftime('%Y-%m-%d')}-{_KOREAN_WEEKDAYS[cur.weekday()]}"
 
 
+def _find_browser_binary() -> str | None:
+    for name in ("chromium-browser", "chromium", "google-chrome"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
 def _build_driver(headless: bool = False, user_data_dir: str | None = None, profile_directory: str | None = None, driver_path: str | None = None) -> webdriver.Chrome:
     opts = Options()
 
-    # User data dir: prefer explicit path; else create a temp profile directory in CWD to avoid clobbering user's main profile
+    # Keep Pilar's browser session separate from the user's normal Chromium profile.
     if user_data_dir:
-        opts.add_argument(f"--user-data-dir={user_data_dir}")
+        profile_path = os.path.abspath(os.path.expanduser(user_data_dir))
     else:
-        temp_profile = os.path.join(os.getcwd(), "chrome_temp")
-        temp_profile = "/tmp/chrome_test2"
-        opts.add_argument(f"--user-data-dir={temp_profile}")
-        opts.add_argument("--password-store=basic")
+        profile_path = os.path.join(os.path.expanduser("~"), ".config", "pilar-chromium")
+    os.makedirs(profile_path, exist_ok=True)
+    opts.add_argument(f"--user-data-dir={profile_path}")
+    opts.add_argument("--password-store=basic")
 
     if profile_directory:
         opts.add_argument(f"--profile-directory={profile_directory}")
 
     # Stability flags
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-extensions")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])  # reduce automation banner
@@ -53,30 +55,37 @@ def _build_driver(headless: bool = False, user_data_dir: str | None = None, prof
     if headless:
         opts.add_argument("--headless=new")
 
-    # Driver resolution priority: explicit path -> system -> webdriver-manager
-    service: Service | None = None
-    if driver_path and os.path.exists(driver_path):
-        service = Service(driver_path)
-    else:
-        # Try plain constructor first (Selenium Manager/system driver)
-        try:
-            drv = webdriver.Chrome(options=opts)
-            drv.maximize_window()
-            return drv
-        except Exception:
-            if _HAS_WDM:
-                #service = Service(ChromeDriverManager().install())
-                service = Service("/usr/bin/chromedriver")
-                driver = webdriver.Chrome(service=service, options=opts)
-            else:
-                # Re-raise with a clearer message
-                raise RuntimeError(
-                    "No ChromeDriver found. Provide --driver-path, install a system driver, or install webdriver-manager."
-                )
+    browser_binary = _find_browser_binary()
+    if browser_binary:
+        opts.binary_location = browser_binary
 
-    drv = webdriver.Chrome(service=service, options=opts)
-    drv.maximize_window()
+    if driver_path:
+        resolved_driver = os.path.abspath(os.path.expanduser(driver_path))
+        if not os.path.isfile(resolved_driver):
+            raise FileNotFoundError(f"ChromeDriver not found: {resolved_driver}")
+    else:
+        resolved_driver = shutil.which("chromedriver")
+
+    # Raspberry Pi packages ship a matching Chromium/ChromeDriver pair. Prefer
+    # that pair and let Selenium Manager run only when no system driver exists.
+    print(f"- browser: {browser_binary or 'Selenium Manager default'}")
+    print(f"- driver: {resolved_driver or 'Selenium Manager'}")
+    print(f"- browser_profile: {profile_path}")
+    service = Service(resolved_driver) if resolved_driver else None
+    drv = webdriver.Chrome(service=service, options=opts) if service else webdriver.Chrome(options=opts)
+    try:
+        drv.maximize_window()
+    except Exception:
+        # Some Raspberry Pi window managers do not implement maximize.
+        try:
+            drv.set_window_size(1280, 900)
+        except Exception:
+            pass
     return drv
+
+
+def _is_kakao_login_url(url: str) -> bool:
+    return "accounts.kakao.com" in url or "account.kakao.com" in url
 
 
 def _wait_visible(wait: WebDriverWait, selectors: list[tuple[str, str]]):
@@ -101,7 +110,7 @@ def _maybe_login(wait: WebDriverWait, email: str, password: str) -> None:
     """
     drv = wait._driver  # type: ignore[attr-defined]
     cur = drv.current_url
-    if "accounts.kakao.com" not in cur and "account.kakao.com" not in cur:
+    if not _is_kakao_login_url(cur):
         return
 
     # Inputs
@@ -138,7 +147,7 @@ def _maybe_login(wait: WebDriverWait, email: str, password: str) -> None:
 
     # Handle potential 2FA or consent screens: give time to complete
     # If a 2FA challenge is detected, wait up to 90s for redirect away from accounts domain
-    WebDriverWait(drv, 90).until(lambda d: "accounts.kakao" not in d.current_url)
+    WebDriverWait(drv, 90).until(lambda d: not _is_kakao_login_url(d.current_url))
 
 
 def _attach_images(wait: WebDriverWait, image_dir: str) -> int:
@@ -263,7 +272,7 @@ def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headles
         if manual_login:
             # Give the user time to complete Kakao verification/2FA
             try:
-                WebDriverWait(drv, 300).until(lambda d: "accounts.kakao" not in d.current_url)
+                WebDriverWait(drv, 300).until(lambda d: not _is_kakao_login_url(d.current_url))
             except Exception:
                 pass
         else:
