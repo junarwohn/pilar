@@ -23,6 +23,79 @@
 
 주의: Web 모드에서는 OpenCV GUI를 사용하지 않습니다(`--no-gui`). `ffmpeg`, `tesseract(ko)`, Chrome/ChromeDriver, Selenium 등의 환경이 필요합니다.
 
+## Linux 부팅 시 Web UI 자동 실행(systemd)
+
+tmux에서 직접 가상환경을 활성화하고 `run-web.sh`를 실행하는 대신, Linux에서는 `systemd` 서비스로 등록하여 부팅 시 자동 실행할 수 있습니다.
+
+GitHub에는 실제 서버 계정명이나 경로가 들어간 서비스 파일을 올리지 않고, 예시 파일만 관리합니다. 이 저장소에는 `deploy/systemd/pilar-web.service.example` 파일이 포함되어 있습니다.
+
+아래 예시는 프로젝트가 `/home/YOUR_USER/workspace/pilar`에 있고, 가상환경이 프로젝트 내부의 `pilar-venv`에 있는 경우입니다. `YOUR_USER`는 실제 Linux 계정명으로 바꿔서 사용하세요.
+
+환경 파일을 준비합니다.
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+서비스 예시 파일을 시스템 경로로 복사한 뒤 서버 환경에 맞게 수정합니다.
+
+```bash
+sudo cp deploy/systemd/pilar-web.service.example /etc/systemd/system/pilar-web.service
+sudo sed -i "s#YOUR_USER#$(whoami)#g" /etc/systemd/system/pilar-web.service
+sudo nano /etc/systemd/system/pilar-web.service
+```
+
+서비스 파일 안의 `YOUR_USER`가 모두 실제 Linux 계정명으로 바뀌었는지 확인하고, 프로젝트 경로가 다르면 함께 수정합니다. `.env` 파일에는 기본적으로 아래 값들이 들어가며, 서비스 실행 시 `run-web.sh`가 이 값을 읽습니다.
+
+```bash
+PORT=8000
+RESULT_RETENTION_DAYS=7
+PILAR_CLEANUP_OLD_RESULTS=1
+```
+
+`PILAR_CLEANUP_OLD_RESULTS=1`이면 Web UI 실행 시 `out/` 아래에서 `RESULT_RETENTION_DAYS`보다 오래된 결과 파일을 삭제하고, 비어 있는 결과 폴더도 정리합니다. 자동 삭제를 끄고 싶으면 `PILAR_CLEANUP_OLD_RESULTS=0`으로 변경하세요.
+
+서비스를 등록하고 실행합니다.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable pilar-web
+sudo systemctl start pilar-web
+```
+
+상태와 로그는 아래 명령으로 확인할 수 있습니다.
+
+```bash
+systemctl status pilar-web
+journalctl -u pilar-web -f
+```
+
+`status=203/EXEC` 오류가 나오면 `ExecStart`에 적힌 파일을 systemd가 실행하지 못한 상태입니다. 보통 서비스 파일에 `YOUR_USER`가 남아 있거나, 경로가 틀렸거나, `run-web.sh`에 실행 권한이 없을 때 발생합니다.
+
+```bash
+systemctl cat pilar-web
+ls -l /home/$(whoami)/workspace/pilar/run-web.sh
+chmod +x /home/$(whoami)/workspace/pilar/run-web.sh
+sudo systemctl daemon-reload
+sudo systemctl restart pilar-web
+```
+
+중지 또는 재시작이 필요할 때는 아래 명령을 사용합니다.
+
+```bash
+sudo systemctl stop pilar-web
+sudo systemctl restart pilar-web
+```
+
+서비스 실행 후 같은 네트워크의 브라우저에서 `http://<서버IP>:8000`으로 접속합니다.
+
+포트를 변경하려면 `.env`의 `PORT` 값을 수정한 뒤 서비스를 재시작합니다.
+
+```bash
+sudo systemctl restart pilar-web
+```
+
 ## 날짜 기반 폴더 생성 도구
 
 비디오 다운로드 등 날짜별로 정리할 수 있도록, 날짜(오늘 기준) 폴더를 만들어 경로를 출력하는 간단한 CLI를 추가했습니다.

@@ -6,10 +6,15 @@
 *.swp
 *.swo
 *.DS_Store
+.npmrc
+.env
+.env.*
+!.env.example
 out/
 pilar-venv/
 
 chrome_temp/
+.chrome-profiles/
 /user_config.ini
 
 # Python
