@@ -4,6 +4,7 @@ import time
 import os
 import configparser
 import logging
+from pilar_logging import configure_logging
 import sys
 from pathlib import Path
 
@@ -29,7 +30,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=8000, help='Web port (default 8000)')
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
 
     if args.web:
         run_web(no_gui=args.no_gui, host=args.host, port=args.port)

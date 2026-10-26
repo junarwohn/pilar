@@ -1,12 +1,14 @@
 import time
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urlencode, urljoin, urlparse
 import os
 import shutil
 import subprocess
 import logging
+import sys
 import importlib
+from pathlib import Path
 
 
 logger = logging.getLogger(__name__)
@@ -26,7 +28,7 @@ class Downloader:
         if _is_false_env(os.getenv("PILAR_YTDLP_AUTO_UPGRADE")):
             logger.info("Skipping yt-dlp pre-upgrade (PILAR_YTDLP_AUTO_UPGRADE disabled)")
             return
-        cmd = os.getenv("PILAR_YTDLP_UPGRADE_CMD", "uv pip install -U yt-dlp")
+        cmd = os.getenv("PILAR_YTDLP_UPGRADE_CMD", 'uv pip install -U --pre "yt-dlp[default]"')
         logger.info("Running yt-dlp pre-upgrade: %s", cmd)
         try:
             proc = subprocess.run(
@@ -50,6 +52,30 @@ class Downloader:
         except Exception as e:
             logger.warning("yt-dlp pre-upgrade error, continue with current version: %s", e)
 
+    def _cleanup_partial_outputs(self):
+        output = Path(self.output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        patterns = [
+            f"{output.name}.part",
+            f"{output.stem}*.part",
+            f"{output.stem}.f*.mp4",
+            f"{output.stem}.f*.m4a",
+            f"{output.stem}.f*.webm",
+        ]
+        candidates = set()
+        for pattern in patterns:
+            candidates.update(output.parent.glob(pattern))
+
+        for candidate in candidates:
+            if candidate == output or not candidate.is_file():
+                continue
+            try:
+                candidate.unlink()
+                logger.info("Removed stale partial download: %s", candidate)
+            except OSError as e:
+                logger.warning("Could not remove stale partial download %s: %s", candidate, e)
+
     def download_video(self, url=None, progress=None):
         if url is None:
             if self.url is None:
@@ -59,6 +85,7 @@ class Downloader:
         if url is None:
             logger.error("No download URL retrieved; skipping download")
             raise ValueError("No download URL provided or found")
+        url = self.normalize_youtube_url(url)
 
         now = time.localtime()
         now_formatted = time.strftime('%Y%m%d-%H%M%S', now)
@@ -68,6 +95,10 @@ class Downloader:
         self._upgrade_yt_dlp()
         yt = importlib.import_module("yt_dlp")
         yt = importlib.reload(yt)
+        self._cleanup_partial_outputs()
+
+        deno_path = shutil.which("deno")
+        js_runtimes = {"deno": {"path": deno_path}} if deno_path else {"deno": {}}
 
         def _hook(d):
             if progress is None:
@@ -95,14 +126,53 @@ class Downloader:
             'outtmpl': self.output_path,
             # Ensure we replace yesterday's file when a new day starts
             'overwrites': True,
+            # YouTube signed media URLs can expire; do not resume stale .part files.
+            'continuedl': False,
+            'retries': 5,
+            'fragment_retries': 5,
+            'extractor_retries': 3,
+            'file_access_retries': 3,
+            'js_runtimes': js_runtimes,
             'progress_hooks': [_hook],
+            'noprogress': not sys.stderr.isatty(),
         }
 
         with yt.YoutubeDL(ydl_opts) as ydl:
             ret = ydl.download([url])
 
+        output = Path(self.output_path)
+        if ret != 0:
+            raise RuntimeError(f"yt-dlp failed with exit code {ret}")
+        if not output.is_file() or output.stat().st_size <= 0:
+            raise RuntimeError(f"Downloaded file was not created: {output}")
+
         return ret, now_formatted
     
+
+    @staticmethod
+    def normalize_youtube_url(url):
+        parsed = urlparse(url)
+        host = parsed.netloc.lower()
+        path_parts = [part for part in parsed.path.split('/') if part]
+        youtube_hosts = {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtube-nocookie.com",
+            "www.youtube-nocookie.com",
+        }
+
+        if host in youtube_hosts and len(path_parts) >= 2 and path_parts[0] == "embed":
+            video_id = path_parts[1]
+            query = parse_qs(parsed.query)
+            params = {"v": video_id}
+            for key in ("list", "start", "t"):
+                values = query.get(key)
+                if values and values[0]:
+                    params[key] = values[0]
+            return f"https://www.youtube.com/watch?{urlencode(params)}"
+
+        return url
 
     @staticmethod
     def get_yn_url():
@@ -142,7 +212,7 @@ class Downloader:
         for iframe in iframes:
             src = iframe.get('src', '')
             if 'youtube' in src:
-                return src
+                return Downloader.normalize_youtube_url(src)
 
         logger.error('No valid YouTube iframe found on detail page')
         return None

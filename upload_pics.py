@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 
 from scripts.kakao_admin_uploader import upload_to_kakao
+from pilar_logging import configure_logging
 
 
 ROOT_DIR = Path(__file__).resolve().parent
@@ -76,6 +77,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_logging()
     args = parse_args()
     cfg_path = Path(args.config).expanduser().resolve()
     global_cfg = load_global_config(cfg_path)

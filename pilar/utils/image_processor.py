@@ -21,6 +21,10 @@ import subprocess
 import shutil
 import platform
 import hashlib
+import sys
+import logging
+
+logger = logging.getLogger(__name__)
 
 # 운영체제에 따른 화살표 키 코드 설정
 if platform.system() == "Windows":
@@ -151,7 +155,7 @@ class ImageProcessor:
             self._metrics_buffer.clear()
         except Exception as e:
             try:
-                print(f"log error: {e}")
+                logger.exception("Could not write processing metrics")
             except Exception:
                 pass
 
@@ -170,7 +174,7 @@ class ImageProcessor:
         except Exception as e:
             # Logging must never break processing
             try:
-                print(f"log error: {e}")
+                logger.exception("Could not buffer processing metrics")
             except Exception:
                 pass
 
@@ -557,7 +561,7 @@ class ImageProcessor:
             text = "\n".join([t for t, _ in lines])
             self._last_ocr_score = float(np.mean([s for _, s in lines])) if lines else 0.0
         except Exception as e:
-            print(f"OCR failed: {e}")
+            logger.exception("OCR failed for frame %s", getattr(self, '_idx', None))
             return ""
         if self.IS_DEBUG:
             elapsed = time.time() - start
@@ -586,7 +590,7 @@ class ImageProcessor:
         idx = 0
         iterable = self.file_list
         if not self.IS_DEBUG:
-            iterable = tqdm(iterable)
+            iterable = tqdm(iterable, disable=not sys.stderr.isatty())
 
         # Scale for image-similarity comparison (match OCR scale from web UI)
         def _scale_for_compare(img: np.ndarray) -> np.ndarray:
@@ -678,7 +682,7 @@ class ImageProcessor:
                     for w in page_words:
                         f.write(f"{w}\n")
             except OSError as e:
-                print(f"Error writing to file: {e}")
+                logger.exception("Could not write accepted subtitle text")
 
             cv2.imwrite(str(Path(self.video_path).parent / f"{datetime.now().strftime('%y%m%d')}_{self.page_cnt + 1:02d}.jpg"), composed)
             self.page_cnt += 1

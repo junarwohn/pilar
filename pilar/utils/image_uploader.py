@@ -6,12 +6,11 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import os
-import re
-import tempfile
-import configparser
-import glob
-import time
 from datetime import datetime
+from scripts.kakao_admin_uploader import (
+    _attach_images, _fill_post_content, _open_editor, _select_blog_type,
+    _wait_submit_enabled, _wait_upload_complete,
+)
 
 class ImageUploader:
     def __init__(self, image_dir, url, id, password, no_gui=False, driver_path="chromedriver", user_data_dir=None, profile_directory="Default"):
@@ -59,7 +58,10 @@ class ImageUploader:
             service=self.service,
             options=self.chrome_options
         )
-        driver.maximize_window()
+        if self.no_gui:
+            driver.set_window_size(1600, 1100)
+        else:
+            driver.maximize_window()
         return driver
     
     # Current not working
@@ -95,42 +97,14 @@ class ImageUploader:
         # Read config file
         url = self.url
         driver = self.setup_driver()
-        driver.get(url)  # Use the URL from config
-
-        wait = WebDriverWait(driver, 10)
-
-        # 2. [제목] 입력
-        # 'div.tit_tf' 내부의 input.tf_g 요소를 찾아 제목 입력
-        title_input = wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "div.tit_tf input.tf_g"))
-        )
-        title_input.clear()
-        title_input.send_keys(f"{current_date}")
-
-        # 3. [사진 첨부]
-        # 파일 첨부 input 요소는 'input.custom.uploadInput' 클래스를 사용하고 있음
-        photo_input = wait.until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "input.custom.uploadInput"))
-        )
-        # find all result jpgs in YYMMDD_##.jpg format
-        cwd = os.getcwd()
-        pattern = os.path.join(cwd, self.image_dir, "[0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9].jpg")
-        jpg_list = glob.glob(pattern)
-
-        # 첨부할 사진의 전체 경로를 지정 (예시: Windows 경로)
-        photo_input.send_keys("\n".join(jpg_list))
-
-        # 4. [등록] 버튼 클릭
-        # 제출 버튼은 'button' 요소 중 type="submit"을 가지며, 클래스 'btn_g btn_g2'를 사용
-        submit_button = wait.until(
-            EC.element_to_be_clickable((By.CSS_SELECTOR, "button.btn_g.btn_g2[type='submit']"))
-        )
-
-        # 버튼에 disabled 속성이 있다면, 제거하여 클릭 가능하게 만듦
-        if submit_button.get_attribute("disabled"):
-            driver.execute_script("arguments[0].removeAttribute('disabled');", submit_button)
-
-        submit_button.click()
-
-        time.sleep(10)
-        driver.quit()
+        try:
+            driver.get(url)
+            wait = WebDriverWait(driver, 15)
+            _open_editor(wait)
+            _select_blog_type(wait)
+            _attach_images(wait, self.image_dir)
+            _fill_post_content(wait, current_date)
+            _wait_submit_enabled(driver).click()
+            _wait_upload_complete(driver, current_date)
+        finally:
+            driver.quit()

@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List, Optional
 
 import cv2
@@ -36,13 +37,7 @@ class OCREngine:
             )
 
         # Configure conservative settings for Intel N100 (small CPU, no GPU)
-        self.logger = logging.getLogger(self.__class__.__name__)
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter("[%(levelname)s] %(name)s: %(message)s")
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
-            self.logger.setLevel(logging.INFO)
+        self.logger = logging.getLogger(__name__)
 
         # Remember whether to run angle classifier at inference time
         self._enable_angle_cls = bool(enable_angle_cls)
@@ -54,6 +49,8 @@ class OCREngine:
             use_angle_cls=enable_angle_cls,
         )
         opt_kwargs = {}
+        debug_logs = os.getenv("PILAR_OCR_DEBUG") == "1"
+        opt_kwargs["show_log"] = debug_logs
         if cpu_threads is not None:
             opt_kwargs["cpu_threads"] = cpu_threads
         # These may not exist on some releases; will be pruned on failure
@@ -69,6 +66,7 @@ class OCREngine:
         while True:
             try:
                 self.ocr = PaddleOCR(**kwargs)
+                logging.getLogger("ppocr").setLevel(logging.DEBUG if debug_logs else logging.WARNING)
                 break
             except TypeError as te:
                 msg = str(te)
@@ -153,7 +151,7 @@ class OCREngine:
             # Some versions return inline list for single image
             return self._result_to_text(result)
         except Exception as e:
-            self.logger.error(f"run_ocr failed: {e}")
+            self.logger.exception("run_ocr failed")
             return ""
 
     def run_ocr_batch(self, images: List[np.ndarray]) -> List[str]:
@@ -164,7 +162,7 @@ class OCREngine:
         try:
             results = self.ocr.ocr(safe_images, cls=self._enable_angle_cls)
         except Exception as e:
-            self.logger.error(f"run_ocr_batch failed: {e}")
+            self.logger.exception("run_ocr_batch failed")
             return ["" for _ in images]
         texts: List[str] = []
         # Results is a list aligned with input images
@@ -187,5 +185,5 @@ class OCREngine:
                 return self._result_to_lines(result[0])
             return self._result_to_lines(result)
         except Exception as e:
-            self.logger.error(f"run_ocr_lines failed: {e}")
+            self.logger.exception("run_ocr_lines failed")
             return []

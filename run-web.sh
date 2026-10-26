@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTHONUNBUFFERED=1
 
 # Simple launcher for Web UI
 # Usage: ./run-web.sh [PORT]

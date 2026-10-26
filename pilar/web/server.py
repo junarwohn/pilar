@@ -7,8 +7,10 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import time
 import html
+import logging
+from uuid import uuid4
 
-from flask import Flask, request, send_file, redirect, url_for, Response, jsonify, stream_with_context
+from flask import Flask, g, request, send_file, redirect, url_for, Response, jsonify, stream_with_context
 import subprocess
 import json
 
@@ -16,10 +18,41 @@ from pilar.utils.downloader import Downloader
 from pilar.utils.image_processor import ImageProcessor
 from pilar.utils.smart_thumbs import smart_auto_thumbs
 from scripts.kakao_admin_uploader import upload_to_kakao
+from pilar_logging import (
+    JobHistory, background_thread, current_job, error_summary,
+    record_failure, request_id, timestamp,
+)
+
+logger = logging.getLogger(__name__)
 
 
-def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2, step_size: int = 150):
+def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2, step_size: int = 150, start_scheduler: bool = True, log_dir=None):
     app = Flask(__name__)
+    jobs = JobHistory(directory=log_dir)
+    app.extensions["job_history"] = jobs
+
+    @app.before_request
+    def _request_started():
+        g.request_started = time.monotonic()
+        g.request_id = uuid4().hex
+        g.request_token = request_id.set(g.request_id)
+
+    @app.after_request
+    def _request_finished(response):
+        response.headers["X-Request-ID"] = g.request_id
+        logger.info("%s %s -> %s", request.method, request.path, response.status_code,
+                    extra={"event": "http_request", "method": request.method, "path": request.path,
+                           "status_code": response.status_code,
+                           "duration_seconds": round(time.monotonic() - g.request_started, 3)})
+        return response
+
+    @app.teardown_request
+    def _request_cleanup(exc):
+        # Flask logs unhandled request failures with the active request context.
+        # Stream cancellation (GeneratorExit) is a normal browser navigation.
+        token = g.pop("request_token", None)
+        if token is not None:
+            request_id.reset(token)
 
     # Paths
     base_path = Path(base_dir)
@@ -91,6 +124,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         "upload": {
             "running": False,
             "last_log": "",
+            "status": "idle",
         },
     }
     cond = threading.Condition()
@@ -103,7 +137,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             with open(bounds_file, 'w', encoding='utf-8') as fh:
                 json.dump(data, fh)
         except Exception:
-            pass
+            logger.exception("Could not save bounds")
 
     def _load_bounds():
         try:
@@ -116,7 +150,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 if u >= 0 and l > u:
                     state["bounds"] = {"upper": u, "lower": l}
         except Exception:
-            pass
+            logger.exception("Could not load bounds")
 
     # Load bounds on startup
     _load_bounds()
@@ -124,21 +158,25 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
     # Persist/restore non-running state
     def _save_state_subset():
         try:
-            data = {
-                "idx": int(state.get("idx", 0)),
-                "step_size": int(state.get("step_size", step_size)),
-                "bounds": state.get("bounds", {}),
-                "bounds_nav": state.get("bounds_nav", {"src": "thumbs", "idx": 0}),
-                "last_log": state.get("last_log", ""),
-                "ocr_scale": float(state.get("ocr_scale", 1.0)),
-                "process_debug": bool(state.get("process_debug", False)),
-                "progress": state.get("progress", {}),
-                "source_url": state.get("source_url"),
-            }
-            with open(state_file, 'w', encoding='utf-8') as fh:
-                json.dump(data, fh)
+            with cond:
+                data = {
+                    "idx": int(state.get("idx", 0)),
+                    "step_size": int(state.get("step_size", step_size)),
+                    "bounds": state.get("bounds", {}),
+                    "bounds_nav": state.get("bounds_nav", {"src": "thumbs", "idx": 0}),
+                    "last_log": state.get("last_log", ""),
+                    "ocr_scale": float(state.get("ocr_scale", 1.0)),
+                    "process_debug": bool(state.get("process_debug", False)),
+                    "progress": state.get("progress", {}),
+                    "source_url": state.get("source_url"),
+                    "upload": dict(state["upload"]),
+                }
+                temporary = state_file.with_suffix(".json.tmp")
+                with open(temporary, 'w', encoding='utf-8') as fh:
+                    json.dump(data, fh)
+                temporary.replace(state_file)
         except Exception:
-            pass
+            logger.exception("Could not persist Web UI state")
 
     def _load_state_subset():
         try:
@@ -172,10 +210,22 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             srcu = data.get("source_url")
             if srcu:
                 state["source_url"] = srcu
+            saved_upload = data.get("upload")
+            if isinstance(saved_upload, dict):
+                state["upload"].update(saved_upload)
+                if state["upload"].get("running"):
+                    state["upload"].update(running=False, status="interrupted",
+                                           finished_at=timestamp(),
+                                           last_log="Upload interrupted by service restart; verify the Kakao post before retrying.")
+                    logger.warning(state["upload"]["last_log"], extra={"event": "upload_interrupted"})
+                    jobs.append({**state["upload"], "event": "job_finished", "stage": "upload",
+                                 "time": timestamp(), "error": state["upload"]["last_log"]})
         except Exception:
-            pass
+            logger.exception("Could not restore Web UI state")
 
     _load_state_subset()
+    if state["upload"].get("status") == "interrupted":
+        _save_state_subset()
 
     # Lazy OCR engine for preview (avoid repeated heavy init)
     _ocr_preview_engine = {"inst": None, "error": None}
@@ -205,60 +255,39 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         except Exception:
             return 3600.0  # fallback: 1 hour
 
+    @jobs.track("daily", trigger="scheduled")
+    def _daily_run():
+        ensure_today_base()
+        with cond:
+            state["last_log"] = "Daily 06:00 auto pipeline starting (download -> process -> upload)"
+            cond.notify_all()
+        prepare_done = threading.Event()
+        if not start_download_extract(None, fps, 5, False, done_event=prepare_done):
+            logger.warning("Daily run skipped: pipeline busy")
+            return {"status": "skipped", "reason": "pipeline busy"}
+        prepare_done.wait()
+        if current_job.get().get("status") == "failed" or not list(extract_dir.glob("*.jpg")):
+            raise RuntimeError("Daily prepare failed or produced no frames")
+        with cond:
+            state["last_log"] = "Daily run: processing images..."
+            cond.notify_all()
+        _process_job(fresh=False, fps_val=fps, q_val=5, hwaccel=False, debug_review=False)
+        if current_job.get().get("status") == "failed" or not _result_files():
+            raise RuntimeError("Daily processing failed or produced no images")
+        return _run_upload_job(allow_manual_login=False)
+
     def _daily_scheduler():
         while True:
+            time.sleep(_seconds_until_next_6am())
             try:
-                to_sleep = _seconds_until_next_6am()
-            except Exception:
-                to_sleep = 3600.0
-            time.sleep(to_sleep)
-            try:
-                ensure_today_base()
+                _daily_run()
+            except Exception as exc:
+                # The job recorder has logged the complete exception already.
                 with cond:
-                    state["last_log"] = "Daily 06:00 auto pipeline starting (download -> process -> upload)"
+                    state["last_log"] = f"Daily run failed: {error_summary(exc)}"
                     cond.notify_all()
-                # Step 1) Download + Extract
-                prepare_done = threading.Event()
-                ok = start_download_extract(None, fps, 5, False, done_event=prepare_done)
-                if not ok:
-                    with cond:
-                        state["last_log"] = "Daily run skipped: pipeline busy"
-                        cond.notify_all()
-                    time.sleep(5)
-                    continue
-
-                # Wait until prepare phase actually completes.
-                # Using an event avoids races where running flags are not yet set.
-                while not prepare_done.wait(timeout=1.0):
-                    pass
-
-                if not list(extract_dir.glob("*.jpg")):
-                    with cond:
-                        state["last_log"] = "Daily run stopped: no extracted frames after prepare."
-                        cond.notify_all()
-                    time.sleep(5)
-                    continue
-
-                # Step 2) Process
-                with cond:
-                    state["last_log"] = "Daily run: processing images..."
-                    cond.notify_all()
-                _process_job(fresh=False, fps_val=fps, q_val=5, hwaccel=False, debug_review=False)
-
-                if not _result_files():
-                    with cond:
-                        state["last_log"] = "Daily run stopped: no result images to upload."
-                        cond.notify_all()
-                    time.sleep(5)
-                    continue
-
-                # Step 3) Upload (auto run disallows manual-login mode)
-                _run_upload_job(allow_manual_login=False)
-                # Avoid immediate retrigger in case clock skew; short nap
-                time.sleep(5)
-            except Exception:
-                # Ignore scheduler errors and continue
-                time.sleep(5)
+                _save_state_subset()
+            time.sleep(5)
 
     # Build a snapshot of current progress for SSE/clients
     def _snapshot():
@@ -319,10 +348,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             }
             # Upload
             up = state.get("upload", {})
-            snap["upload"] = {
-                "running": bool(up.get("running", False)),
-                "last_log": str(up.get("last_log", "") or ""),
-            }
+            snap["upload"] = dict(up)
             snap["message"] = state.get("last_log", "")
             snap["results"] = len(_result_files()) if ' _result_files' in globals() or True else 0
         except Exception:
@@ -405,7 +431,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         return default
 
     def _load_upload_settings() -> dict:
-        cfg_path = Path("user_config.ini").resolve()
+        cfg_path = Path(app.config.get("UPLOAD_CONFIG_FILE", "user_config.ini")).resolve()
         parser = configparser.ConfigParser()
         parser.read(cfg_path, encoding="utf-8")
         if "global" not in parser:
@@ -655,6 +681,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 state["last_log"] = "Busy: cannot start download+extract now."
             return False
 
+        @jobs.track("prepare")
         def _job(url_val, fps_v, q_v, hw_v):
             try:
                 # Phase 1: Download
@@ -668,7 +695,10 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                         state["download"]["progress"] = info
                         cond.notify_all()
 
+                download_ok = False
                 try:
+                    if not used_url:
+                        raise ValueError("No download URL provided or found")
                     with cond:
                         state["download"]["running"] = True
                         state["download"]["last_log"] = "Starting download"
@@ -680,19 +710,31 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                             "status": "starting",
                         }
                         cond.notify_all()
-                    dl.download_video(url=url_val, progress=hook)
+                    dl.download_video(url=used_url, progress=hook)
+                    if not video_path.exists() or video_path.stat().st_size <= 0:
+                        raise RuntimeError(f"Downloaded file was not created: {video_path}")
+                    download_ok = True
                     with cond:
                         p = state["download"]["progress"]
                         p["status"] = "finished"
                         state["download"]["progress"] = p
                         state["download"]["last_log"] = "Download completed"
                 except Exception as e:
+                    record_failure("Download failed", e, log=logger)
                     with cond:
+                        p = state["download"]["progress"]
+                        p["status"] = "error"
+                        state["download"]["progress"] = p
                         state["download"]["last_log"] = f"Download error: {e}"
                 finally:
                     with cond:
                         state["download"]["running"] = False
                         cond.notify_all()
+
+                if not download_ok:
+                    with cond:
+                        state["last_log"] = state["download"]["last_log"]
+                    return
 
                 # Phase 2: Extract
                 _extract_job(fps_v, q_v, hw_v)
@@ -700,7 +742,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 if done_event is not None:
                     done_event.set()
 
-        threading.Thread(target=_job, args=(url, fps_val, q_val, hw), daemon=True).start()
+        background_thread(target=_job, args=(url, fps_val, q_val, hw), daemon=True).start()
         return True
 
     @app.get("/prepare")
@@ -861,6 +903,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 state["smart_thumbs"]["progress"] = {"current": int(cur), "total": int(total), "selected": int(selected)}
                 cond.notify_all()
 
+        @jobs.track("prepare")
         def _job(url_val, fps_v, q_v, hw_v, step_v, window_v, sharpw_v, mineye_v):
             # Phase 1: Download
             dl = Downloader(output_path=str(video_path))
@@ -871,25 +914,40 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 with cond:
                     state["download"]["progress"] = info
                     cond.notify_all()
+            download_ok = False
             try:
+                if not used_url:
+                    raise ValueError("No download URL provided or found")
                 with cond:
                     state["download"]["running"] = True
                     state["download"]["last_log"] = "Starting download"
                     state["download"]["progress"] = {"downloaded": 0, "total": 0, "speed": 0, "eta": 0, "status": "starting"}
                     cond.notify_all()
-                dl.download_video(url=url_val, progress=hook)
+                dl.download_video(url=used_url, progress=hook)
+                if not video_path.exists() or video_path.stat().st_size <= 0:
+                    raise RuntimeError(f"Downloaded file was not created: {video_path}")
+                download_ok = True
                 with cond:
                     p = state["download"]["progress"]
                     p["status"] = "finished"
                     state["download"]["progress"] = p
                     state["download"]["last_log"] = "Download completed"
             except Exception as e:
+                record_failure("Download failed", e, log=logger)
                 with cond:
+                    p = state["download"]["progress"]
+                    p["status"] = "error"
+                    state["download"]["progress"] = p
                     state["download"]["last_log"] = f"Download error: {e}"
             finally:
                 with cond:
                     state["download"]["running"] = False
                     cond.notify_all()
+
+            if not download_ok:
+                with cond:
+                    state["last_log"] = state["download"]["last_log"]
+                return
 
             # Phase 2: Extract
             _extract_job(fps_v, q_v, hw_v)
@@ -913,6 +971,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                     cur = p.get("current", total)
                     state["smart_thumbs"]["progress"] = {"current": int(cur), "total": int(total), "selected": int(p.get("selected", 0))}
             except Exception as e:
+                record_failure("Smart auto thumbs error", e, log=logger)
                 with cond:
                     state["smart_thumbs"]["last_log"] = f"Smart auto thumbs error: {e}"
             finally:
@@ -920,7 +979,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                     state["smart_thumbs"]["running"] = False
                     cond.notify_all()
 
-        t = threading.Thread(target=_job, args=(url, fps_val, q_val, hw, step, window, sharpw, mineye), daemon=True)
+        t = background_thread(target=_job, args=(url, fps_val, q_val, hw, step, window, sharpw, mineye), daemon=True)
         t.start()
         return redirect(url_for("index"))
 
@@ -933,6 +992,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 state["last_log"] = "Busy: cannot start download now."
             return redirect(url_for("index"))
 
+        @jobs.track("download")
         def _download_job(url_val):
             dl = Downloader(output_path=str(video_path))
             used_url = url_val or dl.get_yn_url()
@@ -943,26 +1003,34 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                     state["download"]["progress"] = info
                     cond.notify_all()
             try:
+                if not used_url:
+                    raise ValueError("No download URL provided or found")
                 with cond:
                     state["download"]["running"] = True
                     state["download"]["last_log"] = "Starting download"
                     state["download"]["progress"] = {"downloaded": 0, "total": 0, "speed": 0, "eta": 0, "status": "starting"}
                     cond.notify_all()
-                dl.download_video(url=url_val, progress=hook)
+                dl.download_video(url=used_url, progress=hook)
+                if not video_path.exists() or video_path.stat().st_size <= 0:
+                    raise RuntimeError(f"Downloaded file was not created: {video_path}")
                 with cond:
                     p = state["download"]["progress"]
                     p["status"] = "finished"
                     state["download"]["progress"] = p
                     state["download"]["last_log"] = "Download completed"
             except Exception as e:
+                record_failure("Download failed", e, log=logger)
                 with cond:
+                    p = state["download"]["progress"]
+                    p["status"] = "error"
+                    state["download"]["progress"] = p
                     state["download"]["last_log"] = f"Download error: {e}"
             finally:
                 with cond:
                     state["download"]["running"] = False
                     cond.notify_all()
 
-        t = threading.Thread(target=_download_job, args=(url,), daemon=True)
+        t = background_thread(target=_download_job, args=(url,), daemon=True)
         t.start()
         return redirect(url_for("index"))
 
@@ -1008,8 +1076,19 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         except Exception:
             return 0
 
+    @jobs.track("extract")
     def _extract_job(fps_val: int, q_val: int, hw: bool):
         try:
+            if not video_path.exists() or video_path.stat().st_size <= 0:
+                current_job.get().update(status="skipped", reason="Missing source video")
+                logger.warning("Extraction skipped: missing source video")
+                with cond:
+                    state["extract"]["running"] = False
+                    state["extract"]["last_log"] = f"Extraction skipped: missing video file {video_path}"
+                    state["extract"]["progress"] = {"current": 0, "total": 0, "fps": fps_val}
+                    cond.notify_all()
+                return
+
             with cond:
                 state["extract"]["running"] = True
                 state["extract"]["last_log"] = "Starting extraction"
@@ -1063,10 +1142,14 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 pr = state["extract"]["progress"]
                 total = pr.get("total", 0)
                 state["extract"]["progress"] = {"current": int(cur), "total": int(total), "fps": fps_val}
-                state["extract"]["last_log"] = "Extraction completed"
+                if ret == 0:
+                    state["extract"]["last_log"] = "Extraction completed"
+                else:
+                    raise RuntimeError(f"ffmpeg exited with code {ret}")
                 state["extract"]["running"] = False
                 cond.notify_all()
         except Exception as e:
+            record_failure("Extraction error", e, log=logger)
             with cond:
                 state["extract"]["last_log"] = f"Extraction error: {e}"
                 state["extract"]["running"] = False
@@ -1091,7 +1174,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 q_val = 5
             hw = request.form.get('hw') == '1'
             if not state["extract"]["running"]:
-                t = threading.Thread(target=_extract_job, args=(fps_val, q_val, hw), daemon=True)
+                t = background_thread(target=_extract_job, args=(fps_val, q_val, hw), daemon=True)
                 t.start()
         # Render Extract page with progress bar
         prog = state["extract"]["progress"]
@@ -1267,6 +1350,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 _save_state_subset()
                 # Optionally kick off smart thumbs after saving
                 if run_smart:
+                    @jobs.track("smart_thumbs")
                     def _job():
                         with cond:
                             state["smart_thumbs"]["running"] = True
@@ -1291,13 +1375,14 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                                 cur = p.get("current", total)
                                 state["smart_thumbs"]["progress"] = {"current": int(cur), "total": int(total), "selected": int(p.get("selected", 0))}
                         except Exception as e:
+                            record_failure("Smart auto thumbs error", e, log=logger)
                             with cond:
                                 state["smart_thumbs"]["last_log"] = f"Smart auto thumbs error: {e}"
                         finally:
                             with cond:
                                 state["smart_thumbs"]["running"] = False
                                 cond.notify_all()
-                    threading.Thread(target=_job, daemon=True).start()
+                    background_thread(target=_job, daemon=True).start()
                     return redirect(url_for('preprocess'))
             elif act == 'auto_bounds':
                 try:
@@ -1577,6 +1662,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 state["smart_thumbs"]["progress"] = {"current": int(cur), "total": int(total), "selected": int(selected)}
                 cond.notify_all()
 
+        @jobs.track("smart_thumbs")
         def _job():
             with cond:
                 state["smart_thumbs"]["running"] = True
@@ -1613,6 +1699,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                         cond.notify_all()
                     _save_state_subset()
             except Exception as e:
+                record_failure("Smart auto thumbs error", e, log=logger)
                 with cond:
                     state["smart_thumbs"]["last_log"] = f"Smart auto thumbs error: {e}"
             finally:
@@ -1620,7 +1707,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                     state["smart_thumbs"]["running"] = False
                     cond.notify_all()
 
-        threading.Thread(target=_job, daemon=True).start()
+        background_thread(target=_job, daemon=True).start()
         # Redirect back to Pre-Process so user can fine-tune bounds on representative image
         return redirect(url_for("preprocess"))
 
@@ -1671,6 +1758,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 pass
         return removed
 
+    @jobs.track("process")
     def _process_job(fresh: bool = False, fps_val: int = fps, q_val: int = 5, hwaccel: bool = False, debug_review: bool = False):
         try:
             state["processing"] = True
@@ -1732,9 +1820,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             if need_extract:
                 _extract_job(fps_val, q_val, hwaccel)
             if len(list(extract_dir.glob('*.jpg'))) == 0:
-                with cond:
-                    state["last_log"] = "No frames to process. Prepare frames first."
-                return
+                raise FileNotFoundError("No frames to process. Prepare frames first.")
 
             proc = ImageProcessor(
                 video_path=str(video_path),
@@ -1764,9 +1850,12 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             proc.process_files()
             if state.get("stop"):
                 state["last_log"] = "Processing stopped by user"
+                current_job.get()["status"] = "stopped"
             else:
                 state["last_log"] = "Processing completed"
+            current_job.get()["image_count"] = len(_result_files())
         except Exception as e:
+            record_failure("Image processing failed", e, log=logger)
             state["last_log"] = f"Processing error: {e}"
         finally:
             state["processing"] = False
@@ -1804,7 +1893,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         should_start = (request.method == 'POST' and request.form.get('start') == '1')
         debug_mode = bool(state.get("process_debug", False))
         if should_start and not state["processing"] and not state["download"]["running"] and not state["extract"]["running"] and not state["smart_thumbs"]["running"]:
-            t = threading.Thread(target=_process_job, args=(fresh, fps_val, q_val, hwaccel, debug_mode), daemon=True)
+            t = background_thread(target=_process_job, args=(fresh, fps_val, q_val, hwaccel, debug_mode), daemon=True)
             t.start()
         msg = "Running..." if state["processing"] else state["last_log"]
         # Initialize progress UI based on current state to avoid flashing 0%
@@ -1870,17 +1959,28 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 cond.notify_all()
         return redirect(url_for('process_run'))
 
+    @jobs.track("upload")
     def _run_upload_job(allow_manual_login: bool = True):
+        job = current_job.get()
+        started = time.monotonic()
         with cond:
-            state["upload"]["running"] = True
-            state["upload"]["last_log"] = "Starting upload..."
+            state["upload"] = {**job, "running": True, "last_log": "Starting upload..."}
             state["last_log"] = "Starting upload..."
             cond.notify_all()
+        _save_state_subset()
+
+        def progress(stage, message, details):
+            with cond:
+                state["upload"].update(last_log=message, upload_stage=stage, **details)
+                state["last_log"] = message
+                cond.notify_all()
+            jobs.append({**job, **details, "event": "job_progress", "time": timestamp(), "upload_stage": stage, "message": message})
+
         try:
             s = _load_upload_settings()
             if not allow_manual_login and s["manual_login"]:
                 raise ValueError("Daily auto upload requires manual_login=false in user_config.ini")
-            upload_to_kakao(
+            result = upload_to_kakao(
                 url=s["url"],
                 email=s["email"],
                 password=s["password"],
@@ -1891,42 +1991,59 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 driver_path=s["driver_path"],
                 title=s["title"],
                 manual_login=bool(s["manual_login"]),
+                progress=progress,
             )
+            if result["status"] not in ("completed", "skipped"):
+                raise RuntimeError("Uploader returned an unexpected result")
+            message = (result.get("reason") or "Upload skipped: post already exists.") if result["status"] == "skipped" else f"Upload done: {result.get('image_count', 0)} images published as blog."
             with cond:
-                state["upload"]["last_log"] = "Upload done."
-                state["last_log"] = "Upload done."
+                state["upload"].update(result, last_log=message)
+                state["last_log"] = message
                 cond.notify_all()
+            return result
         except Exception as e:
+            record_failure("Kakao upload failed", e, log=logger)
             with cond:
-                state["upload"]["last_log"] = f"Upload failed: {e}"
-                state["last_log"] = f"Upload failed: {e}"
+                state["upload"].update(status="failed", error=error_summary(e), last_log=f"Upload failed: {error_summary(e)}")
+                state["last_log"] = state["upload"]["last_log"]
                 cond.notify_all()
+            return {"status": "failed"}
         finally:
             with cond:
-                state["upload"]["running"] = False
+                state["upload"].update(running=False, finished_at=timestamp())
+                state["upload"]["duration_seconds"] = round(time.monotonic() - started, 3)
                 cond.notify_all()
+            _save_state_subset()
 
     @app.post("/upload")
     def upload_run():
         ensure_today_base()
-        if state["upload"]["running"]:
-            with cond:
+        with cond:
+            if state["upload"]["running"]:
                 state["last_log"] = "Upload already running."
                 cond.notify_all()
-            return redirect(url_for("results"))
-        if state["download"]["running"] or state["extract"]["running"] or state["processing"] or state["smart_thumbs"]["running"]:
-            with cond:
+                logger.info("Upload request ignored: upload already running")
+                return redirect(url_for("results"))
+            if state["download"]["running"] or state["extract"]["running"] or state["processing"] or state["smart_thumbs"]["running"]:
                 state["last_log"] = "Busy: stop running jobs before upload."
                 cond.notify_all()
-            return redirect(url_for("results"))
-        if not _result_files():
-            with cond:
+                logger.warning(state["last_log"])
+                return redirect(url_for("results"))
+            if not _result_files():
                 state["last_log"] = "No results to upload."
                 cond.notify_all()
-            return redirect(url_for("results"))
+                logger.warning(state["last_log"])
+                return redirect(url_for("results"))
+            # Reserve the job before starting its thread, including rapid repeated POSTs.
+            state["upload"].update(running=True, status="running", last_log="Starting upload...")
 
-        threading.Thread(target=_run_upload_job, daemon=True).start()
+        background_thread(target=_run_upload_job, daemon=True).start()
         return redirect(url_for("results"))
+
+    @app.get("/jobs")
+    def job_history():
+        limit = min(100, max(1, request.args.get("limit", default=20, type=int)))
+        return jsonify(jobs.recent(stage=request.args.get("stage"), limit=limit))
 
     @app.get("/status")
     def status():
@@ -1944,6 +2061,7 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
             "results": len(_result_files()),
             "progress": prog,
             "percent": percent,
+            "upload": dict(state["upload"]),
         })
 
     @app.get("/review")
@@ -2043,7 +2161,10 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
                 f"</div>"
             )
         grid = "".join(items)
+        upload_message = html.escape(state["upload"].get("last_log") or "Ready to upload.")
         body = f"""
+        <p id='uploadStatus' role='status' aria-live='polite'>{upload_message}</p>
+        <details class='card'><summary>최근 업로드 기록</summary><ul id='uploadHistory'></ul></details>
         <div class='mt-2'>
           <form method='post' action='{url_for('upload_run')}' class='js-post' data-redirect='{url_for('results')}' style='display:inline-block;'>
             <button id='uploadBtn' type='submit' class='btn' {upload_disable}>{upload_btn_label}</button>
@@ -2061,6 +2182,27 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
         </div>
         <script>
           const RESULT_FILES = {names_js};
+          let previousUploadStatus = null;
+          async function loadUploadHistory() {{
+            try {{
+              const response = await fetch('{url_for('job_history')}?stage=upload&limit=5');
+              if (!response.ok) return;
+              const history = await response.json();
+              const list = document.getElementById('uploadHistory');
+              list.replaceChildren();
+              for (const entry of history) {{
+                const item = document.createElement('li');
+                const status = ({{completed:'완료', failed:'실패', skipped:'건너뜀', interrupted:'중단'}})[entry.status] || entry.status;
+                item.textContent = new Date(entry.finished_at).toLocaleString() + ' · ' + status +
+                  (entry.image_count ? ' · 이미지 ' + entry.image_count + '장' : '') +
+                  (entry.error ? ' · ' + entry.error : '') +
+                  (entry.reason ? ' · ' + entry.reason : '');
+                list.appendChild(item);
+              }}
+              if (!history.length) list.textContent = '아직 기록이 없습니다.';
+            }} catch (error) {{ console.error('Could not load upload history', error); }}
+          }}
+          loadUploadHistory();
           function syncUploadBtn(running) {{
             const btn = document.getElementById('uploadBtn');
             if (!btn) return;
@@ -2073,6 +2215,14 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
               try {{
                 const s = JSON.parse(ev.data || '{{}}');
                 syncUploadBtn(!!(s.upload && s.upload.running));
+                const upload = s.upload || {{}};
+                const status = document.getElementById('uploadStatus');
+                if (status) {{
+                  status.textContent = upload.last_log || 'Ready to upload.';
+                  status.style.color = upload.status === 'failed' ? '#b42318' : '#333';
+                }}
+                if (upload.status !== previousUploadStatus && !upload.running) loadUploadHistory();
+                previousUploadStatus = upload.status;
               }} catch {{}}
             }};
           }} catch {{}}
@@ -2210,10 +2360,14 @@ def create_app(base_dir: str, no_gui: bool = True, zoom: int = 112, fps: int = 2
 
     # Start daily scheduler thread once
     try:
-        if not state.get('scheduler_started'):
-            threading.Thread(target=_daily_scheduler, daemon=True).start()
+        if start_scheduler and not state.get('scheduler_started'):
+            background_thread(target=_daily_scheduler, daemon=True).start()
             state['scheduler_started'] = True
     except Exception:
-        pass
+        logger.exception("Could not start daily scheduler")
+
+    logger.info("Pilar application started", extra={"event": "application_started"})
+    logger.info("Job history directory=%s retention_days=%s scheduler_enabled=%s",
+                jobs.directory, jobs.retention_days, start_scheduler)
 
     return app

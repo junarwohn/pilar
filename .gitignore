@@ -11,6 +11,7 @@
 .env.*
 !.env.example
 out/
+logs/
 pilar-venv/
 
 chrome_temp/

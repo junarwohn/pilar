@@ -2,6 +2,10 @@ import os
 import time
 from pathlib import Path
 
+from pilar_logging import configure_logging
+
+configure_logging()
+
 from pilar.web.server import create_app
 
 

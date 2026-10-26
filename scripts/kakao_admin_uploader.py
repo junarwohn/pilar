@@ -1,11 +1,22 @@
 import argparse
 import glob
 import os
+import re
 import sys
 import time
+import logging
 from datetime import datetime
+from pilar_logging import configure_logging
+
+logger = logging.getLogger(__name__)
 
 from selenium import webdriver
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    NoSuchFrameException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -21,6 +32,10 @@ except Exception:
 
 
 _KOREAN_WEEKDAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+_EDITOR_FIELD_SELECTOR = (
+    "textarea#description, textarea[name='description'], "
+    "div.tit_tf input.tf_g, input[name='title'], input[placeholder*='제목']"
+)
 
 
 def default_daily_title(now: datetime | None = None) -> str:
@@ -59,9 +74,13 @@ def _build_driver(headless: bool = False, user_data_dir: str | None = None, prof
         # Try plain constructor first (Selenium Manager/system driver)
         try:
             drv = webdriver.Chrome(options=opts)
-            drv.maximize_window()
+            if headless:
+                drv.set_window_size(1600, 1100)
+            else:
+                drv.maximize_window()
             return drv
         except Exception:
+            logger.warning("Chrome startup through Selenium Manager failed; trying fallback driver", exc_info=True)
             if _HAS_WDM:
                 service = Service(ChromeDriverManager().install())
             else:
@@ -71,23 +90,136 @@ def _build_driver(headless: bool = False, user_data_dir: str | None = None, prof
                 )
 
     drv = webdriver.Chrome(service=service, options=opts)
-    drv.maximize_window()
+    if headless:
+        drv.set_window_size(1600, 1100)
+    else:
+        drv.maximize_window()
     return drv
 
 
+def _find_elements(drv, selector: str, text: str | None = None):
+    """Find CSS matches across Kakao Business microfrontends' open shadow roots."""
+    return drv.execute_script(r"""
+        const [selector, text] = arguments;
+        const matches = [];
+        function visit(root) {
+            for (const element of root.querySelectorAll(selector)) {
+                if (text === null || element.textContent.replace(/\s+/g, ' ').trim() === text) {
+                    matches.push(element);
+                }
+            }
+            for (const element of root.querySelectorAll('*')) {
+                if (element.shadowRoot) visit(element.shadowRoot);
+            }
+        }
+        visit(document);
+        return matches;
+    """, selector, text)
+
+
 def _wait_visible(wait: WebDriverWait, selectors: list[tuple[str, str]]):
-    """Try multiple selectors, return the first located WebElement."""
-    last_exc = None
-    for by, sel in selectors:
+    """Wait for the first matching element, including hidden file inputs."""
+    def located(drv):
+        for by, selector in selectors:
+            elements = (
+                _find_elements(drv, selector)
+                if by == By.CSS_SELECTOR else drv.find_elements(by, selector)
+            )
+            if elements:
+                return elements[0]
+        return False
+
+    return wait.until(located)
+
+
+def _open_editor(wait: WebDriverWait):
+    """Open the composer from the post list, or reuse an already open editor.
+
+    Match the create button by its label, including the nested inner_g span,
+    and keep the driver in the frame containing the visible content field.
+    """
+    create_clicked = False
+
+    def find_in_context(drv):
+        nonlocal create_clicked
+        for field in _find_elements(drv, _EDITOR_FIELD_SELECTOR):
+            if field.is_displayed() and field.is_enabled():
+                return field
+        if not create_clicked:
+            for selector in ("button, a, [role='button']", "span.inner_g"):
+                for button in _find_elements(drv, selector, "새 소식 만들기"):
+                    if selector == "span.inner_g" and drv.execute_script(
+                        "return arguments[0].closest('button, a, [role=button]') !== null", button
+                    ):
+                        continue
+                    if button.is_displayed() and button.is_enabled():
+                        button.click()
+                        create_clicked = True
+                        logger.info("Opened '새 소식 만들기'; waiting for the editor.")
+                        return False
+        return False
+
+    def editor_ready(drv):
+        drv.switch_to.default_content()
         try:
-            el = wait.until(EC.presence_of_element_located((by, sel)))
-            return el
-        except Exception as e:
-            last_exc = e
-            continue
-    if last_exc:
-        raise last_exc
-    raise RuntimeError("No selector provided")
+            content_input = find_in_context(drv)
+            if content_input:
+                return content_input
+            for frame in _find_elements(drv, "iframe"):
+                try:
+                    drv.switch_to.frame(frame)
+                    content_input = find_in_context(drv)
+                    if content_input:
+                        return content_input
+                finally:
+                    if not content_input:
+                        drv.switch_to.default_content()
+        except (StaleElementReferenceException, NoSuchFrameException, ElementClickInterceptedException):
+            drv.switch_to.default_content()
+        return False
+
+    try:
+        return wait.until(editor_ready)
+    except TimeoutException as exc:
+        raise TimeoutException(
+            "Kakao post editor did not open. Could not find a visible content field "
+            "after looking for '새 소식 만들기'. Check the login session and kakao_url."
+        ) from exc
+
+
+def _select_blog_type(wait: WebDriverWait) -> None:
+    """Select 블로그형 before attachments and require its selected state."""
+    clicked = False
+
+    def selected(drv):
+        nonlocal clicked
+        try:
+            for tab in _find_elements(drv, "[role='tab']", "블로그형"):
+                if not tab.is_displayed():
+                    continue
+                if tab.get_attribute("aria-selected") == "true":
+                    return True
+                if not clicked and tab.is_enabled() and tab.get_attribute("aria-disabled") != "true":
+                    drv.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", tab)
+                    tab.click()
+                    clicked = True
+        except (StaleElementReferenceException, ElementClickInterceptedException):
+            pass
+        return False
+
+    try:
+        wait.until(selected)
+    except TimeoutException as exc:
+        raise TimeoutException("Could not select '블로그형'; upload stopped before attaching images.") from exc
+
+
+def _fill_post_content(wait: WebDriverWait, content: str) -> None:
+    """Fill the daily date in blog title and content, or the card content field."""
+    _open_editor(wait)
+    for field in _find_elements(wait._driver, _EDITOR_FIELD_SELECTOR):
+        if field.is_displayed() and field.is_enabled():
+            field.clear()
+            field.send_keys(content)
 
 
 def _maybe_login(wait: WebDriverWait, email: str, password: str) -> None:
@@ -151,6 +283,8 @@ def _attach_images(wait: WebDriverWait, image_dir: str) -> int:
     file_input = _wait_visible(
         wait,
         [
+            (By.CSS_SELECTOR, ".ibox_upload input[type='file'][accept*='image/']"),
+            (By.CSS_SELECTOR, "input[type='file'][accept*='image/']"),
             (By.CSS_SELECTOR, "input.custom.uploadInput"),
             (By.CSS_SELECTOR, "input[type='file']"),
         ],
@@ -161,83 +295,98 @@ def _attach_images(wait: WebDriverWait, image_dir: str) -> int:
 
     # Heuristic: wait until uploads finish. Try to detect thumbnails or no progress spinners.
     try:
-        WebDriverWait(drv, 60).until_not(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".loading, .spinner, .progress"))
+        WebDriverWait(drv, 60).until(
+            lambda d: not any(
+                element.is_displayed()
+                for element in _find_elements(d, ".loading, .spinner, .progress")
+            )
         )
     except Exception:
         # Best-effort fallback
+        logger.warning("Could not confirm attachment progress; waiting before checking registration", exc_info=True)
         time.sleep(8)
 
     return len(files)
 
 
 def _already_uploaded_today(drv: webdriver.Chrome, today_title: str) -> bool:
-    """Return True if card list already contains today's title."""
-    container_xpath = "//*[@id='mArticle']/div/div/div[2]/div/div"
-    try:
-        WebDriverWait(drv, 10).until(
-            EC.presence_of_element_located((By.XPATH, container_xpath))
+    """Check both the new Business table and legacy Channel post cards."""
+    def list_loaded(d):
+        if any(field.is_displayed() for field in _find_elements(d, _EDITOR_FIELD_SELECTOR)):
+            return True
+        # A table skeleton can exist before the rows have arrived. Do not decide
+        # that today's post is absent until dated post content is available.
+        return any(
+            re.search(r"\d{4}-\d{2}-\d{2}", row.text)
+            for row in _find_elements(d, ".cont_posts tbody tr, .card_list .box_card, #mArticle")
         )
-    except Exception:
-        # If list area is not present (e.g. directly on editor), do not block upload.
+
+    try:
+        WebDriverWait(drv, 10).until(list_loaded)
+    except TimeoutException:
         return False
-
-    # Primary selector from provided structure
-    title_xpath = f"{container_xpath}/div/div[2]/div[2]/div[1]/strong"
-    try:
-        titles = drv.find_elements(By.XPATH, title_xpath)
-        for el in titles:
-            txt = (el.text or "").strip()
-            if txt == today_title:
-                return True
-    except Exception:
-        pass
-
-    # Fallback selector by classes under card_list/box_card
-    try:
-        cards = drv.find_elements(By.CSS_SELECTOR, "div.card_list div.box_card")
-        for card in cards:
-            try:
-                strong = card.find_element(By.CSS_SELECTOR, "strong")
-                txt = (strong.text or "").strip()
-                if txt == today_title:
-                    return True
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    return False
+    return any(
+        element.is_displayed()
+        for element in _find_elements(drv, "a, strong, .tit_post, .tit_g, .txt_g", today_title)
+    )
 
 
 def _wait_submit_enabled(drv: webdriver.Chrome, timeout: int = 180):
     """Wait until submit button becomes enabled after image upload."""
     selectors = [
-        "button.btn_g.btn_g2[type='submit']",
-        "button[type='submit']",
-        "button[aria-label*='등록'], button[aria-label*='저장']",
+        ("button, a, [role='button']", "등록"),
+        ("button.btn_g.btn_g2[type='submit']", None),
+        ("button[aria-label*='등록'], button[aria-label*='저장']", None),
+        ("button[type='submit']", None),
     ]
 
-    end = time.time() + max(1, timeout)
-    last_btn = None
-    while time.time() < end:
-        for sel in selectors:
+    end = time.monotonic() + max(1, timeout)
+    while time.monotonic() < end:
+        for selector, text in selectors:
             try:
-                btn = drv.find_element(By.CSS_SELECTOR, sel)
-                last_btn = btn
-                disabled_attr = btn.get_attribute("disabled")
-                class_name = (btn.get_attribute("class") or "").lower()
-                is_disabled = (disabled_attr is not None) or ("disabled" in class_name)
-                if btn.is_enabled() and not is_disabled:
-                    return btn
-            except Exception:
+                for btn in _find_elements(drv, selector, text):
+                    disabled_attr = btn.get_attribute("disabled")
+                    class_name = (btn.get_attribute("class") or "").lower()
+                    is_disabled = (
+                        disabled_attr is not None
+                        or "disabled" in class_name
+                        or btn.get_attribute("aria-disabled") == "true"
+                    )
+                    if btn.is_displayed() and btn.is_enabled() and not is_disabled:
+                        return btn
+            except StaleElementReferenceException:
                 continue
         time.sleep(0.5)
 
     raise TimeoutError("Submit button did not become enabled within timeout") from None
 
 
-def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headless: bool = False, user_data_dir: str | None = None, profile_directory: str | None = None, driver_path: str | None = None, title: str | None = None, manual_login: bool = False) -> None:
+def _wait_upload_complete(drv: webdriver.Chrome, content: str, timeout: int = 60):
+    """Require Kakao's publication acknowledgement before reporting success."""
+    def published(d):
+        if any(el.is_displayed() for el in _find_elements(d, "*", "발행 성공")):
+            return True
+        # Legacy pages return directly to the post list instead of showing a dialog.
+        if _find_elements(d, ".cont_posts tbody tr, .card_list .box_card"):
+            return any(
+                el.is_displayed()
+                for el in _find_elements(d, "a, strong, .tit_post, .tit_g, .txt_g", content)
+            )
+        return False
+
+    try:
+        WebDriverWait(drv, timeout).until(published)
+    except TimeoutException as exc:
+        raise TimeoutException("Kakao did not confirm publication after clicking '등록'.") from exc
+
+
+def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headless: bool = False, user_data_dir: str | None = None, profile_directory: str | None = None, driver_path: str | None = None, title: str | None = None, manual_login: bool = False, progress=None) -> dict:
+    def report(stage, message, **details):
+        logger.info(message, extra={"event": "upload_stage", "stage": stage, **details})
+        if progress:
+            progress(stage, message, details)
+
+    report("browser", "Starting Chrome for Kakao upload")
     drv = _build_driver(
         headless=headless,
         user_data_dir=user_data_dir,
@@ -247,74 +396,53 @@ def upload_to_kakao(url: str, email: str, password: str, image_dir: str, headles
     wait = WebDriverWait(drv, 15)
 
     try:
+        report("login", "Opening Kakao and checking login session")
         drv.get(url)
 
         today_title = default_daily_title()
-        if _already_uploaded_today(drv, today_title):
-            print(f"Skip upload: today's post already exists ({today_title}).")
-            return
-
         # If we land on Kakao login
         if manual_login:
             # Give the user time to complete Kakao verification/2FA
             try:
                 WebDriverWait(drv, 300).until(lambda d: "accounts.kakao" not in d.current_url)
-            except Exception:
-                pass
+            except TimeoutException:
+                logger.exception("Timed out waiting for manual Kakao login")
+                raise
         else:
             _maybe_login(wait, email, password)
 
-        # Ensure we are at the editor page
-        # If the site uses an iframe-based editor, switch if needed (best-effort)
-        try:
-            iframes = drv.find_elements(By.TAG_NAME, "iframe")
-            for f in iframes:
-                try:
-                    drv.switch_to.frame(f)
-                    # If title field exists in this frame, stay; else revert
-                    _ = drv.find_elements(By.CSS_SELECTOR, "div.tit_tf input.tf_g, input[name='title']")
-                    if _:
-                        break
-                    drv.switch_to.default_content()
-                except Exception:
-                    drv.switch_to.default_content()
-        except Exception:
-            pass
+        report("duplicate_check", "Checking whether today's post already exists")
+        if _already_uploaded_today(drv, today_title):
+            message = f"Upload skipped: today's post already exists ({today_title})."
+            report("skipped", message, title=today_title)
+            return {"status": "skipped", "title": today_title, "image_count": 0, "reason": message}
 
-        # Title input
+        # Open the composer, attach images, then put the daily date in 내용.
         ttl = title or today_title
-        title_input = _wait_visible(
-            wait,
-            [
-                (By.CSS_SELECTOR, "div.tit_tf input.tf_g"),
-                (By.CSS_SELECTOR, "input[name='title']"),
-                (By.CSS_SELECTOR, "input[placeholder*='제목']"),
-            ],
-        )
-        try:
-            title_input.clear()
-        except Exception:
-            pass
-        title_input.send_keys(ttl)
-
-        # Attach images
+        report("editor", "Opening the blog post editor")
+        _open_editor(wait)
+        _select_blog_type(wait)
+        report("attachments", "Attaching processed images")
         count = _attach_images(wait, image_dir)
+        report("content", f"Attached {count} images; filling title and content", image_count=count, title=ttl)
+        _fill_post_content(wait, ttl)
 
         # Give UI a short settle time, then wait until submit button is truly enabled.
         time.sleep(5)
         submit_btn = _wait_submit_enabled(drv, timeout=180)
+        report("publishing", "Registering blog post and waiting for publication confirmation")
         submit_btn.click()
 
-        # User requested immediate close behavior after click.
-        time.sleep(3)
+        _wait_upload_complete(drv, ttl)
 
-        print(f"Uploaded {count} images with title '{ttl}'.")
+        report("completed", f"Uploaded {count} images as blog with content '{ttl}'.", image_count=count, title=ttl)
+        return {"status": "completed", "title": ttl, "image_count": count}
     finally:
         try:
             time.sleep(2)
             drv.quit()
         except Exception:
-            pass
+            logger.warning("Could not close Chrome after Kakao upload", exc_info=True)
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -335,6 +463,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: list[str]) -> int:
+    configure_logging()
     args = parse_args(argv)
     if not args.manual_login:
         if not args.email or not args.password:
